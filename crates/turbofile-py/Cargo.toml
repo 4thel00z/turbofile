@@ -15,3 +15,9 @@ crate-type = ["cdylib"]
 [dependencies]
 turbofile-core = { path = "../turbofile-core" }
 pyo3 = { version = "0.25", features = ["abi3-py312"] }
+
+# Calibration probe only: measures the floor of an inline (no thread hop)
+# submission design against the current bridge. Not on any production path.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = { workspace = true }

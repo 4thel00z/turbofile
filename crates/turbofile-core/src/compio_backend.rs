@@ -197,6 +197,7 @@ async fn execute(op: Op, open_id: Option<u64>, files: Files) -> io::Result<Reply
             file.close().await?;
             Ok(Reply::Written { n, end: n as u64 })
         }
+        Op::Nop => Ok(Reply::Unit),
     }
 }
 

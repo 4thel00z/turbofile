@@ -1,0 +1,25 @@
+#!/usr/bin/env bpftrace
+/*
+ * io_uring request lifecycle for one pid.
+ *
+ * The question this answers: does a page-cache-hot buffered read complete
+ * inline inside io_uring_enter, or does the kernel punt it to an io-wq worker
+ * thread? A punt costs a wake and a context-switch pair, which on a machine
+ * with an 18 us C-state exit latency is most of the cost of the operation.
+ *
+ * usage: bpftrace perf/uring.bt <pid> [seconds]
+ */
+
+BEGIN { printf("tracing io_uring for pid %d\n", $1); }
+
+tracepoint:io_uring:io_uring_submit_req       /pid == $1/ { @submitted = count(); }
+tracepoint:io_uring:io_uring_queue_async_work /pid == $1/ { @punted_to_iowq = count(); }
+tracepoint:io_uring:io_uring_complete         /pid == $1/ { @completed = count(); }
+tracepoint:io_uring:io_uring_cqring_wait      /pid == $1/ { @cqring_wait_slept = count(); }
+tracepoint:io_uring:io_uring_task_work_run    /pid == $1/ { @task_work_run = count(); }
+tracepoint:io_uring:io_uring_file_get         /pid == $1/ { @file_get = count(); }
+
+/* Self-terminating so a harness can wrap it without signal juggling. */
+interval:s:1 { @secs++; if (@secs >= ($2 ? $2 : 5)) { exit(); } }
+
+END { delete(@secs); }

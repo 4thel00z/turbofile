@@ -157,17 +157,35 @@ async def bench_small_file_storm(dirpath: str, count: int, runs: int) -> None:
     print()
 
 
+def fstype(path: str) -> str:
+    """Filesystem backing `path`, from the longest matching mount point."""
+    best, name = "", "?"
+    for line in open("/proc/self/mounts"):
+        parts = line.split()
+        if path.startswith(parts[1]) and len(parts[1]) >= len(best):
+            best, name = parts[1], parts[2]
+    return name
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument(
+        "--dir",
+        help="where to put fixture files. This matters: tmpfs sets no "
+        "FMODE_NOWAIT, so the page-cache fast path is unavailable there and "
+        "io_uring must punt every buffered read to a kernel worker. Defaults "
+        "to the system temp dir, which is usually tmpfs.",
+    )
     args = parser.parse_args()
     runs = 20 if args.quick else 100
 
-    print(
-        f"turbofile backend: {_turbofile.backend_name()}  "
-        f"python: {sys.version.split()[0]}  platform: {sys.platform}\n"
-    )
-    with tempfile.TemporaryDirectory() as dirpath:
+    with tempfile.TemporaryDirectory(dir=args.dir) as dirpath:
+        print(
+            f"turbofile backend: {_turbofile.backend_name()}  "
+            f"python: {sys.version.split()[0]}  platform: {sys.platform}  "
+            f"fs: {fstype(dirpath)}\n"
+        )
         await bench_whole_file(dirpath, 4 * KIB, runs * 2)
         await bench_whole_file(dirpath, 8 * MIB, max(10, runs // 2))
         await bench_random_reads(dirpath, 32, runs)

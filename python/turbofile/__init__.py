@@ -80,7 +80,13 @@ async def open_file(
 
 
 async def read_bytes(path: Any) -> bytes:
-    return await _turbofile.read_file(os.fspath(path))
+    p = os.fspath(path)
+    # Whole file from page cache on this thread when nothing would block;
+    # otherwise one submission does open+read+close on the driver.
+    data = _turbofile.try_read_file(p)
+    if data is None:
+        return await _turbofile.read_file(p)
+    return data
 
 
 async def write_bytes(path: Any, data: Any) -> int:
