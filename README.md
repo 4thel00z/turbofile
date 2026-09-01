@@ -105,10 +105,11 @@ or as an escape hatch). Windows (IOCP via compio) is planned.
 - `opener=` and integer file descriptors are not supported.
 - `read_bytes` on very large files pays one buffer copy; prefer
   `open(...).read()` for multi-megabyte files.
-- A submitted kernel op cannot be recalled, so cancelling an `await` waits for
-  it: the `CancelledError` is delivered when the op completes, and your buffer
-  is never touched after the `await` raises. Cancellation is therefore not
-  prompt; an op that never completes blocks it.
+- Cancelling an `await` sends a kernel-level abort request (`aio_cancel` on
+  macOS; the compio driver stops before the next chunk), best-effort by
+  nature: an op the kernel finishes first settles with its result. Either way
+  the `CancelledError` arrives only once the op has settled, so your buffer
+  is never touched after the `await` raises.
 
 ## Development
 

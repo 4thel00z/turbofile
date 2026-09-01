@@ -194,3 +194,83 @@ fn backend_label_reports_the_live_driver() {
         assert_eq!(aio.backend_label(), "darwin-aio");
     }
 }
+
+#[test]
+fn compio_cancel_settles_every_op() {
+    cancel_settles_every_op(BackendKind::Compio, false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn darwin_aio_cancel_settles_every_op() {
+    cancel_settles_every_op(BackendKind::DarwinAio, true);
+}
+
+/// Every op settles after a cancel burst: aborted ops with ECANCELED, the
+/// rest with the full payload; the driver keeps serving afterwards. On the
+/// darwin backend the tail of the burst sits in the userspace queue behind
+/// kern.aioprocmax, so at least one abort is guaranteed.
+fn cancel_settles_every_op(kind: BackendKind, queue_floor: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancel.bin");
+    let driver = Driver::new(kind).unwrap();
+    let payload = vec![7u8; 65536];
+    submit_wait(
+        &driver,
+        Op::WriteFile {
+            path: path.clone(),
+            data: Payload::Owned(payload.clone()),
+        },
+    )
+    .unwrap();
+    let handle = open_handle(
+        &driver,
+        &path,
+        OpenSpec {
+            read: true,
+            ..OpenSpec::default()
+        },
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let mut ids = Vec::new();
+    for _ in 0..64 {
+        let tx = tx.clone();
+        ids.push(driver.submit(
+            Op::ReadAt {
+                handle,
+                pos: 0,
+                dest: Dest::Alloc { len: 65536 },
+            },
+            Box::new(move |result| tx.send(result).unwrap()),
+        ));
+    }
+    for id in &ids[32..] {
+        driver.cancel(*id);
+    }
+    let mut cancelled = 0;
+    for _ in 0..64 {
+        match rx.recv().unwrap() {
+            Ok(Reply::Bytes(data)) => assert_eq!(data, payload),
+            Err(e) if turbofile_core::is_cancelled(&e) => cancelled += 1,
+            other => panic!("unexpected settle: {other:?}"),
+        }
+    }
+    if queue_floor {
+        assert!(cancelled > 0);
+    }
+
+    match submit_wait(
+        &driver,
+        Op::ReadAt {
+            handle,
+            pos: 0,
+            dest: Dest::Alloc { len: 4 },
+        },
+    )
+    .unwrap()
+    {
+        Reply::Bytes(data) => assert_eq!(data, vec![7u8; 4]),
+        other => panic!("expected bytes, got {other:?}"),
+    }
+}

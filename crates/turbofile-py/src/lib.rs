@@ -17,7 +17,7 @@ use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3::BoundObject;
 
-use turbofile_core::{BackendKind, Dest, Driver, Op, OpenSpec, Payload, Reply};
+use turbofile_core::{is_cancelled, BackendKind, Dest, Driver, Op, OpenSpec, Payload, Reply};
 
 /// Cleared by `shutdown()` (registered with atexit): once the interpreter is
 /// finalizing, driver-thread completions must never attach to Python again.
@@ -27,15 +27,17 @@ static GET_RUNNING_LOOP: GILOnceCell<PyObject> = GILOnceCell::new();
 
 static KERNEL_FUTURE: GILOnceCell<PyObject> = GILOnceCell::new();
 
-/// A submitted kernel op cannot be recalled, so its future refuses
-/// cancellation: `Task.cancel` falls back to `_must_cancel`, the
-/// `CancelledError` is delivered when the op completes, and caller buffers are
-/// never touched after the `await` raises.
+/// `cancel()` forwards an abort request for the future's kernel ops (their
+/// ids sit in `op_ids`) and returns False: the future settles when the ops
+/// do, promptly on abort, so caller buffers are never touched after the
+/// `await` raises. `deliver` turns an ECANCELED settle into a real
+/// cancellation via `settle_cancelled`.
 fn kernel_future_class(py: Python<'_>) -> PyResult<&'static PyObject> {
     KERNEL_FUTURE.get_or_try_init(py, || {
         let ns = PyDict::new(py);
+        ns.set_item("cancel_kernel_ops", wrap_pyfunction!(cancel_ops, py)?)?;
         py.run(
-            c"import asyncio\n\nclass KernelFuture(asyncio.Future):\n    \"\"\"Completion of an in-flight kernel op; refuses cancellation.\"\"\"\n\n    def cancel(self, msg: object = None) -> bool:\n        return False\n",
+            c"import asyncio\n\nclass KernelFuture(asyncio.Future):\n    \"\"\"Completion of in-flight kernel ops; cancel() requests their abort.\"\"\"\n\n    def cancel(self, msg: object = None) -> bool:\n        if self.done():\n            return False\n        cancel_kernel_ops(self.op_ids)\n        return False\n\n    def settle_cancelled(self) -> bool:\n        return super().cancel()\n",
             Some(&ns),
             Some(&ns),
         )?;
@@ -193,6 +195,9 @@ fn deliver(py: Python<'_>, completion: Completion) {
         .unwrap_or(true);
     if !done {
         match result {
+            Err(e) if is_cancelled(&e) => {
+                fut.call_method0("settle_cancelled").ok();
+            }
             Err(e) => {
                 let exc = io_err_to_pyerr(e).into_value(py);
                 fut.call_method1("set_exception", (exc,)).ok();
@@ -302,7 +307,7 @@ fn submit(py: Python<'_>, op: Op, output: Output, owner: Option<Owner>) -> PyRes
     let bridge = bridge_for_running_loop(py)?;
     let fut = bridge.create_future.bind(py).call0()?.unbind();
     let result_fut = fut.clone_ref(py);
-    driver.submit(
+    let id = driver.submit(
         op,
         Box::new(move |result| {
             bridge.complete(Completion {
@@ -313,6 +318,8 @@ fn submit(py: Python<'_>, op: Op, output: Output, owner: Option<Owner>) -> PyRes
             });
         }),
     );
+    // Same-thread with the GIL held: nothing can read op_ids before this.
+    result_fut.bind(py).setattr("op_ids", (id,))?;
     Ok(result_fut)
 }
 
@@ -456,13 +463,15 @@ fn read_parallel(
         }),
     });
     if len == 0 {
+        result_fut.bind(py).setattr("op_ids", Vec::<u64>::new())?;
         group.chunk_done(0, 0, Ok(Reply::Read { n: 0 }));
         return Ok(result_fut);
     }
+    let mut ids = Vec::with_capacity(chunk_count);
     for start in (0..len).step_by(chunk) {
         let chunk_len = chunk.min(len - start);
         let group = group.clone();
-        driver.submit(
+        ids.push(driver.submit(
             Op::ReadAt {
                 handle,
                 pos: pos + start as u64,
@@ -472,9 +481,21 @@ fn read_parallel(
                 },
             },
             Box::new(move |result| group.chunk_done(start, chunk_len, result)),
-        );
+        ));
     }
+    result_fut.bind(py).setattr("op_ids", ids)?;
     Ok(result_fut)
+}
+
+/// Best-effort abort of the kernel ops behind one future; ops the kernel
+/// already completed deliver their result instead.
+#[pyfunction]
+fn cancel_ops(ops: Vec<u64>) -> PyResult<()> {
+    let driver = driver()?;
+    for id in ops {
+        driver.cancel(id);
+    }
+    Ok(())
 }
 
 #[pyfunction]
@@ -588,6 +609,7 @@ fn _turbofile(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(size, m)?)?;
     m.add_function(wrap_pyfunction!(read_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_file, m)?)?;
+    m.add_function(wrap_pyfunction!(cancel_ops, m)?)?;
     m.add_function(wrap_pyfunction!(backend_name, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
     Ok(())
