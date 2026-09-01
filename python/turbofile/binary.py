@@ -32,10 +32,10 @@ class BinaryFile:
         self.is_open = True
         # Read-ahead: bytes already fetched for [pos, pos + len(pending)).
         self.pending = b""
-        # Latched off once a probe shows RWF_NOWAIT reads can never succeed on
-        # this file (no FMODE_NOWAIT, as on tmpfs), so such files pay one doomed
-        # syscall per file rather than per read.
-        self.fast = True
+        # Per-file page-cache fast path; None once a probe shows it can never
+        # apply to this file (no FMODE_NOWAIT on Linux tmpfs, an unmappable
+        # descriptor on macOS), so such files pay one probe rather than one per read.
+        self.fast: Any = _turbofile.FastPath(fd)
         # Last size this object observed; a heuristic, never a correctness input.
         self.size_hint = size
 
@@ -59,29 +59,32 @@ class BinaryFile:
         if not self.info.writable:
             raise io.UnsupportedOperation("not writable")
 
+    def fast_declined(self) -> None:
+        """After a None from the fast path: drop it if it can never apply here."""
+        if self.fast and not self.fast.supported():
+            self.fast = None
+
     async def read_at(self, pos: int, size: int) -> bytes:
         """One positional read, page-cache fast path first.
 
-        `try_read` serves pages that are already resident on this thread and
-        returns None whenever the fast path does not apply: the data is not
-        resident and the read would have to block, the filesystem refuses
-        RWF_NOWAIT, or the position does not fit the kernel's off_t. Every None
-        falls back to a kernel submission and a completion hop, and a refused
-        RWF_NOWAIT also latches the fast path off for this file.
+        `FastPath.read` serves pages that are already resident on this thread
+        and returns None whenever the fast path does not apply: the data is not
+        resident and the read would have to block, the file cannot be checked
+        for residency without blocking, or the position does not fit the
+        kernel's off_t. Every None falls back to a kernel submission and a
+        completion hop; a file that can never be served is latched off.
         """
-        data = _turbofile.try_read(self.fd, pos, size) if self.fast else None
+        data = self.fast.read(pos, size) if self.fast else None
         if data is None:
-            if self.fast and not _turbofile.fast_read_supported(self.fd):
-                self.fast = False
+            self.fast_declined()
             return await _turbofile.read(self.handle, pos, size)
         return data
 
     async def readinto_at(self, pos: int, view: Buffer) -> int:
         """`readinto` counterpart of `read_at`."""
-        n = _turbofile.try_readinto(self.fd, pos, view) if self.fast else None
+        n = self.fast.readinto(pos, view) if self.fast else None
         if n is None:
-            if self.fast and not _turbofile.fast_read_supported(self.fd):
-                self.fast = False
+            self.fast_declined()
             return await _turbofile.readinto(self.handle, pos, view)
         return n
 
@@ -92,10 +95,9 @@ class BinaryFile:
             start = self.pos + len(self.pending)
             if self.size_hint - start >= LARGE_READ:
                 return await self.read_all_large(start)
-            rest = _turbofile.try_read_all(self.fd, start) if self.fast else None
+            rest = self.fast.read_all(start) if self.fast else None
             if rest is None:
-                if self.fast and not _turbofile.fast_read_supported(self.fd):
-                    self.fast = False
+                self.fast_declined()
                 rest = await _turbofile.read_to_end(self.handle, start)
             data = self.pending + rest if self.pending else rest
             self.pending = b""
@@ -271,6 +273,7 @@ class BinaryFile:
             return
         self.is_open = False
         self.pending = b""
+        self.fast = None
         await _turbofile.close(self.handle)
 
     async def fileno(self) -> int:

@@ -103,12 +103,39 @@ original post ruled out cache thrashing.
 operation puts both threads to sleep. The bridge was already at its floor. The
 only fix available was to stop crossing threads.
 
-Hence `try_read` / `try_read_all` / `try_read_file`: serve reads from resident
-pages with `preadv2(RWF_NOWAIT)` on the event-loop thread, and fall back to the
-existing async submission when — and only when — the read would block. The
-kernel's `EAGAIN` is what makes that safe; nothing on the fast path can stall
-the loop.
+Hence `FastPath.read` / `.read_all` and `try_read_file`: serve reads from
+resident pages on the event-loop thread, and fall back to the existing async
+submission when — and only when — the read would block. On Linux that is
+`preadv2(RWF_NOWAIT)`, and the kernel's `EAGAIN` is what makes it safe; nothing
+on the fast path can stall the loop.
 
 Result on ext4: sized reads went 44,274 ns → **1,303 ns (34x)**, whole-file
 `read_bytes` 73,103 ns → **5,284 ns (13.8x)**, both within ~250 ns of the
 blocking `pread` floor. tmpfs takes the fallback and is unchanged.
+
+### macOS
+
+The same ladder on an Apple Silicon Mac (macOS 26.4) shows the same picture:
+`bridge` costs 34,030 ns against a 534 ns `pread` floor, so the thread hop is
+91% of `read`. Darwin has no `RWF_NOWAIT`, but `mincore` on a `PROT_NONE`
+mapping of the file reports which pages the unified buffer cache holds, and it
+tracks residency exactly: a buffered write leaves every page resident, an
+`F_NOCACHE` write none, one `pread` makes exactly that page resident, and pages
+past EOF report absent. So `FastPath` keeps one such mapping per open file,
+asks `mincore` about the pages a read touches, and copies with a plain `pread`
+— never through the mapping, so a truncate elsewhere cannot fault the process.
+The check and the copy are two syscalls, so a page evicted between them makes
+that one `pread` wait for the disk: rare, bounded, never wrong.
+
+Result on APFS: `file_read` went 37,958 ns → **1,124 ns (34x)**, about 530 ns
+above the `pread` floor; the `mincore` call is most of that gap.
+
+`read_bytes` stays on the async path on macOS. Darwin has no equivalent of
+`openat2(RESOLVE_CACHED)`, and measuring `open()` on this machine showed why an
+inline open is not acceptable: with Jamf Protect's Endpoint Security extension
+active, the first open of a file costs ~300 µs at the median and over 400 µs at
+p99, and even repeated opens of one file show 1–2 ms tails. Inline would cut
+the median from 65 µs to 17 µs and put every one of those stalls on the event
+loop instead of the driver thread.
+
+`inline_read` needs an io_uring, so the ladder has that rung on Linux only.
