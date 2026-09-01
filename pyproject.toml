@@ -1,0 +1,52 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "turbofile"
+version = "0.1.0"
+description = "Real async file I/O for Python: io_uring, IOCP and POSIX AIO via Rust, with an aiofiles-compatible API"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "4thel00z" }]
+keywords = ["async", "asyncio", "file-io", "io_uring", "aio", "iocp", "aiofiles", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Framework :: AsyncIO",
+    "Topic :: System :: Filesystems",
+]
+
+[project.urls]
+Repository = "https://github.com/4thel00z/turbofile"
+Issues = "https://github.com/4thel00z/turbofile/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "turbofile._turbofile"
+manifest-path = "crates/turbofile-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+# The declared License-Files live at the workspace root, outside the
+# manifest dir — include them explicitly or PyPI rejects the sdist (PEP 639).
+include = [
+    { path = "LICENSE-MIT", format = "sdist" },
+    { path = "LICENSE-APACHE", format = "sdist" },
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.7",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    # Parity oracle for the drop-in tests and the benchmark baseline.
+    "aiofiles>=24",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"

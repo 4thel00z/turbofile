@@ -1,0 +1,17 @@
+[package]
+name = "turbofile-py"
+description = "Python bindings for turbofile (extension module turbofile._turbofile)"
+# Distributed as wheels on PyPI via maturin, never as a crate.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_turbofile"
+crate-type = ["cdylib"]
+
+[dependencies]
+turbofile-core = { path = "../turbofile-core" }
+pyo3 = { version = "0.25", features = ["abi3-py312"] }
