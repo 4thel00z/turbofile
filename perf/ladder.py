@@ -48,13 +48,24 @@ SIZE = 4096
 
 
 def fstype(path: str) -> str:
-    """Filesystem backing `path`, from the longest matching mount point."""
-    best, name = "", "?"
-    for line in open("/proc/self/mounts"):
-        parts = line.split()
-        if path.startswith(parts[1]) and len(parts[1]) >= len(best):
-            best, name = parts[1], parts[2]
-    return name
+    """Filesystem backing `path`, from the longest matching mount point.
+
+    Only Linux is asked, via /proc/self/mounts; elsewhere this reports "?".
+    The label exists to warn about tmpfs, which is a Linux concern, and it is
+    never worth failing a benchmark over a cosmetic string.
+    """
+    try:
+        with open("/proc/self/mounts") as mounts:
+            best, name = "", "?"
+            for line in mounts:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                if path.startswith(parts[1]) and len(parts[1]) >= len(best):
+                    best, name = parts[1], parts[2]
+            return name
+    except OSError:
+        return "?"
 
 
 class Fixture:
