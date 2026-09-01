@@ -1,3 +1,5 @@
+PY ?= .venv/bin/python
+
 .DEFAULT_GOAL := help
 
 ##@ Development
@@ -31,7 +33,29 @@ develop: ## Install the Python package into the active venv
 
 .PHONY: bench
 bench: ## Run the benchmark suite against aiofiles
-	uv run python benchmarks/bench.py
+	$(PY) benchmarks/bench.py $(if $(FS),--dir $(FS))
+
+##@ Performance
+
+.PHONY: ladder
+ladder: ## Latency ladder: attribute per-op cost to a layer (FS=dir to pick a filesystem)
+	$(PY) perf/ladder.py --batch 2000 --reps 20 $(if $(FS),--dir $(FS))
+
+.PHONY: counters
+counters: ## Hardware counters per ladder rung (needs CAP_PERFMON on perf)
+	perf/counters.sh $(if $(FS),--dir $(FS)) 3
+
+.PHONY: flame
+flame: ## Sampled profile of one rung: make flame RUNG=read
+	perf/flame.sh $(if $(FS),--dir $(FS)) $(or $(RUNG),read) 5
+
+.PHONY: uring
+uring: ## io_uring tracepoint counts for a running pid: make uring PID=1234
+	bpftrace perf/uring.bt $(PID) 5
+
+.PHONY: wake
+wake: ## Ground-truth cross-thread wake cost on this machine
+	$(PY) perf/wake_probe.py
 
 ##@ Help
 

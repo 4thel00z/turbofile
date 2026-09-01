@@ -929,6 +929,8 @@ dependencies = [
 name = "turbofile-py"
 version = "0.1.0"
 dependencies = [
+ "io-uring",
+ "libc",
  "pyo3",
  "turbofile-core",
 ]

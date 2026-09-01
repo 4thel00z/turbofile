@@ -54,8 +54,23 @@ Mac (macOS 26.4, POSIX AIO backend, page-cache-hot files):
 Large sequential transfers are memory-bandwidth-bound in the page cache, so
 every implementation converges there; turbofile wins where per-op overhead and
 concurrency dominate, which is what an asyncio application actually does.
-io_uring numbers on Linux come from CI; run `make bench` there for your
-hardware.
+
+On Linux, reads whose pages are already resident are served inline on the
+event-loop thread with `preadv2(RWF_NOWAIT)` — no submission, no driver-thread
+hop, no completion wakeup — falling back to async submission when the kernel
+says the read would block. Page-cache-hot 4 KiB reads on ext4:
+
+| operation                | before  | after   |         |
+| ------------------------ | ------- | ------- | ------- |
+| `open` + `read(n)`       | 44.3 us | 1.30 us | **34x** |
+| `read_bytes`             | 73.1 us | 5.28 us | **14x** |
+| blocking `pread` (floor) | 1.08 us |         |         |
+
+Benchmark on a real filesystem: tmpfs sets no `FMODE_NOWAIT`, which disables
+the fast path and makes io_uring punt every read to a kernel worker, so `/tmp`
+numbers are not comparable. `make bench` and `make ladder` take `FS=<dir>` and
+print which filesystem they measured. See `perf/README.md` for the analysis
+harness.
 
 ## Backends
 
