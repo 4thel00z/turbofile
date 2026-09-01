@@ -31,7 +31,7 @@ async def test_doorbell_never_loses_a_wakeup(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_future_does_not_break_the_bridge(tmp_path) -> None:
+async def test_cancel_is_refused_and_results_still_delivered(tmp_path) -> None:
     path = str(tmp_path / "cancel.bin")
     payload = b"y" * 65536
     await _turbofile.write_file(path, payload)
@@ -41,13 +41,38 @@ async def test_cancelled_future_does_not_break_the_bridge(tmp_path) -> None:
 
     futures = [_turbofile.read(handle, 0, 65536) for _ in range(8)]
     for fut in futures[:4]:
-        fut.cancel()
-    survivors = await asyncio.gather(*futures[4:])
-    for chunk in survivors:
+        assert fut.cancel() is False
+    results = await asyncio.gather(*futures)
+    for chunk in results:
         assert chunk == payload
-    await asyncio.sleep(0.05)
+    assert not any(fut.cancelled() for fut in futures)
 
     assert await _turbofile.read(handle, 0, 4) == b"yyyy"
+    await _turbofile.close(handle)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_raises_only_after_the_op_completed(tmp_path) -> None:
+    path = str(tmp_path / "cancelinto.bin")
+    payload = b"z" * 65536
+    await _turbofile.write_file(path, payload)
+    handle, _, _ = await _turbofile.open(
+        path, True, False, False, False, False, False
+    )
+
+    buffer = bytearray(len(payload))
+
+    async def fill() -> int:
+        return await _turbofile.readinto(handle, 0, buffer)
+
+    task = asyncio.create_task(fill())
+    await asyncio.sleep(0)  # one step: the op is submitted, the task suspended
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+    assert bytes(buffer) == payload
+
     await _turbofile.close(handle)
 
 

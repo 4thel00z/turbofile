@@ -14,7 +14,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use pyo3::BoundObject;
 
 use turbofile_core::{BackendKind, Dest, Driver, Op, OpenSpec, Payload, Reply};
@@ -24,6 +24,27 @@ use turbofile_core::{BackendKind, Dest, Driver, Op, OpenSpec, Payload, Reply};
 static ALIVE: AtomicBool = AtomicBool::new(true);
 
 static GET_RUNNING_LOOP: GILOnceCell<PyObject> = GILOnceCell::new();
+
+static KERNEL_FUTURE: GILOnceCell<PyObject> = GILOnceCell::new();
+
+/// A submitted kernel op cannot be recalled, so its future refuses
+/// cancellation: `Task.cancel` falls back to `_must_cancel`, the
+/// `CancelledError` is delivered when the op completes, and caller buffers are
+/// never touched after the `await` raises.
+fn kernel_future_class(py: Python<'_>) -> PyResult<&'static PyObject> {
+    KERNEL_FUTURE.get_or_try_init(py, || {
+        let ns = PyDict::new(py);
+        py.run(
+            c"import asyncio\n\nclass KernelFuture(asyncio.Future):\n    \"\"\"Completion of an in-flight kernel op; refuses cancellation.\"\"\"\n\n    def cancel(self, msg: object = None) -> bool:\n        return False\n",
+            Some(&ns),
+            Some(&ns),
+        )?;
+        let class = ns
+            .get_item("KernelFuture")?
+            .ok_or_else(|| PyRuntimeError::new_err("KernelFuture class not defined"))?;
+        Ok(class.unbind())
+    })
+}
 
 struct Globals {
     driver: Mutex<Option<(u32, Arc<Driver>)>>,
@@ -94,6 +115,8 @@ struct LoopBridge {
     armed: AtomicBool,
     event_loop: PyObject,
     call_soon_threadsafe: PyObject,
+    /// `functools.partial(KernelFuture, loop=event_loop)`.
+    create_future: PyObject,
     drain: OnceLock<PyObject>,
 }
 
@@ -243,11 +266,20 @@ fn bridge_for_running_loop(py: Python<'_>) -> PyResult<Arc<LoopBridge>> {
             .map(|closed| !closed)
             .unwrap_or(false)
     });
+    let class = kernel_future_class(py)?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("loop", &event_loop)?;
+    let create_future = py
+        .import("functools")?
+        .getattr("partial")?
+        .call((class.bind(py),), Some(&kwargs))?
+        .unbind();
     let bridge = Arc::new(LoopBridge {
         key,
         queue: Mutex::new(Vec::new()),
         armed: AtomicBool::new(false),
         call_soon_threadsafe: event_loop.getattr("call_soon_threadsafe")?.unbind(),
+        create_future,
         event_loop: event_loop.unbind(),
         drain: OnceLock::new(),
     });
@@ -268,11 +300,7 @@ fn bridge_for_running_loop(py: Python<'_>) -> PyResult<Arc<LoopBridge>> {
 fn submit(py: Python<'_>, op: Op, output: Output, owner: Option<Owner>) -> PyResult<PyObject> {
     let driver = driver()?;
     let bridge = bridge_for_running_loop(py)?;
-    let fut = bridge
-        .event_loop
-        .bind(py)
-        .call_method0("create_future")?
-        .unbind();
+    let fut = bridge.create_future.bind(py).call0()?.unbind();
     let result_fut = fut.clone_ref(py);
     driver.submit(
         op,
@@ -411,11 +439,7 @@ fn read_parallel(
     }
     let driver = driver()?;
     let bridge = bridge_for_running_loop(py)?;
-    let fut = bridge
-        .event_loop
-        .bind(py)
-        .call_method0("create_future")?
-        .unbind();
+    let fut = bridge.create_future.bind(py).call0()?.unbind();
     let result_fut = fut.clone_ref(py);
 
     let bytes = PyBytes::new_with(py, len, |_| Ok(()))?;
