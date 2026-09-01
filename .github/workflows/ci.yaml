@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux exercises the io_uring driver (with polling fallback under
+        # the runner's seccomp profile); macOS exercises the POSIX AIO
+        # backend and the compio polling driver.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: astral-sh/setup-uv@v5
+      - name: Rust format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Build extension
+        run: |
+          uv sync
+          uv run maturin develop --release
+      - name: Python tests
+        run: uv run pytest
+      - name: Python tests (compio backend)
+        if: runner.os == 'macOS'
+        run: TURBOFILE_BACKEND=compio uv run pytest
+      - name: Benchmark smoke
+        run: uv run python benchmarks/bench.py --quick
