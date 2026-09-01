@@ -123,6 +123,21 @@ async def test_growth_between_size_and_read(workdir: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_large_file_round_trips(workdir: Path) -> None:
+    """Larger than every internal chunk, so it spans several reads either way."""
+    payload = os.urandom(8 << 20)
+    p = workdir / "large.bin"
+    p.write_bytes(payload)
+    assert await turbofile.read_bytes(p) == payload
+    async with turbofile.open(p, "rb") as f:
+        assert await f.read() == payload
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "posix_fadvise"),
+    reason="needs posix_fadvise to evict the page cache (Linux only)",
+)
+@pytest.mark.asyncio
 async def test_uncached_file_still_correct(workdir: Path) -> None:
     """Evicted pages force the EAGAIN fallback; the bytes must still be right."""
     payload = os.urandom(8 << 20)
