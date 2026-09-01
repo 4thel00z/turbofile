@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.1](https://github.com/4thel00z/turbofile/compare/v0.1.0...v0.1.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* make the fast path decline explicitly instead of leaning on EINVAL ([cdaf880](https://github.com/4thel00z/turbofile/commit/cdaf880e180eb29977f556169719db21dcccf425))
+* report filesystem as "?" where /proc is unavailable ([75962ea](https://github.com/4thel00z/turbofile/commit/75962ea0fa7f8c3cf3df1b7e542543de50738653))
+
+
+### Performance Improvements
+
+* serve page-cache-hot reads inline on macOS with mincore + pread ([3272a35](https://github.com/4thel00z/turbofile/commit/3272a35a136f15083bcf8ac388123fb960e1eac3))
+* serve page-cache-hot reads inline with preadv2(RWF_NOWAIT) ([9ca717c](https://github.com/4thel00z/turbofile/commit/9ca717c5e6bd93006430564953cf7f2c89f2dfc0))
+
 ## [0.1.0](https://github.com/4thel00z/turbofile/compare/v0.1.0...v0.1.0) (2026-09-01)
 
 
