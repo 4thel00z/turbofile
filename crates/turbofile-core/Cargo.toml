@@ -1,0 +1,18 @@
+[package]
+name = "turbofile-core"
+description = "Backend drivers for turbofile: compio (io_uring/IOCP/polling) everywhere, POSIX AIO on macOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[dependencies]
+compio = { workspace = true }
+flume = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

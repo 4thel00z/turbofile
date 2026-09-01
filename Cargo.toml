@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/turbofile-core", "crates/turbofile-py"]
+
+[workspace.package]
+version = "0.1.0" # x-release-please-version
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/4thel00z/turbofile"
+readme = "README.md"
+keywords = ["async", "file", "io-uring", "aio", "iocp"]
+
+[workspace.dependencies]
+turbofile-core = { path = "crates/turbofile-core", version = "0.1.0" } # x-release-please-version
+# `polling` on top of the defaults enables the fusion driver on Linux:
+# io_uring when the kernel allows it, automatic fallback to the polling
+# driver under seccomp or old kernels.
+compio = { version = "0.19", default-features = false, features = [
+    "runtime",
+    "io-uring",
+    "polling",
+    "fs",
+] }
+flume = "0.11"
+libc = "0.2"
+
+# `panic` is deliberately left as "unwind": the Python extension relies on
+# unwinding to turn Rust panics into Python exceptions rather than aborting
+# the interpreter.
+[profile.release]
+lto = "thin"
+codegen-units = 1
