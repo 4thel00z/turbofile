@@ -38,12 +38,13 @@ def report(name: str, samples: list[float], per_run_bytes: int, baseline: float 
     mean = statistics.mean(samples)
     p50 = statistics.median(samples)
     mbps = per_run_bytes / mean / MIB if per_run_bytes else 0.0
-    speedup = f"  {baseline / mean:5.2f}x vs aiofiles" if baseline else ""
-    line = f"  {name:<28} {p50 * 1e3:9.3f} ms p50 {mean * 1e3:9.3f} ms mean"
+    speedup = f"  {baseline / p50:5.2f}x vs aiofiles" if baseline else ""
+    unit, scale = ("ms", 1e3) if mean >= 1e-4 else ("us", 1e6)
+    line = f"  {name:<28} {p50 * scale:9.3f} {unit} p50 {mean * scale:9.3f} {unit} mean"
     if per_run_bytes:
         line += f" {mbps:9.1f} MiB/s"
     print(line + speedup)
-    return mean
+    return p50
 
 
 async def bench_whole_file(dirpath: str, size: int, runs: int) -> None:
@@ -76,6 +77,40 @@ async def bench_whole_file(dirpath: str, size: int, runs: int) -> None:
     report("turbofile.read_bytes", await timed(runs, with_turbofile), size, base)
     report("turbofile.open+read", await timed(runs, with_turbofile_open), size, base)
     report("sync baseline (blocking)", await timed(runs, with_sync), size, base)
+    print()
+
+
+async def bench_open_file_read(dirpath: str, runs: int) -> None:
+    """One 4 KiB read on an already-open, page-cache-hot file."""
+    size = 4 * KIB
+    path = os.path.join(dirpath, "open-read.bin")
+    with open(path, "wb") as f:
+        f.write(os.urandom(size))
+    print(f"4 KiB read on an open file, page-cache-hot, {runs} runs")
+
+    async with aiofiles.open(path, "rb") as af:
+
+        async def with_aiofiles() -> None:
+            await af.seek(0)
+            await af.read(size)
+
+        base = report("aiofiles", await timed(runs, with_aiofiles), size, None)
+
+    async with turbofile.open(path, "rb") as tf:
+
+        async def with_turbofile() -> None:
+            await tf.seek(0)
+            await tf.read(size)
+
+        report("turbofile", await timed(runs, with_turbofile), size, base)
+
+    with open(path, "rb") as sf:
+
+        async def with_sync() -> None:
+            sf.seek(0)
+            sf.read(size)
+
+        report("sync baseline (blocking)", await timed(runs, with_sync), size, base)
     print()
 
 
@@ -199,6 +234,7 @@ async def main() -> None:
         )
         await bench_whole_file(dirpath, 4 * KIB, runs * 2)
         await bench_whole_file(dirpath, 8 * MIB, max(10, runs // 2))
+        await bench_open_file_read(dirpath, runs * 50)
         await bench_random_reads(dirpath, 32, runs)
         await bench_write(dirpath, max(10, runs // 2))
         await bench_small_file_storm(dirpath, 200, max(10, runs // 4))
