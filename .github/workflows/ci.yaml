@@ -4,6 +4,10 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # release-please dispatches ci onto its PR branch: events created with
+  # GITHUB_TOKEN never start pull_request runs, workflow_dispatch is the
+  # documented exception.
+  workflow_dispatch:
 
 jobs:
   test:

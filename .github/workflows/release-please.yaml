@@ -34,6 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,6 +54,14 @@ jobs:
           git add Cargo.lock
           git commit -m "chore: sync Cargo.lock with release version"
           git push origin "HEAD:${BRANCH}"
+      # This job's pushes and release-please's PR both come from GITHUB_TOKEN,
+      # so they never start pull_request runs of ci; dispatch ci onto the PR
+      # head explicitly so the release PR gets real checks.
+      - name: Run ci on the release PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+        run: gh workflow run ci.yaml --repo "${GITHUB_REPOSITORY}" --ref "${BRANCH}"
 
   # PyPI publish chains off this workflow because tags created by
   # release-please's GITHUB_TOKEN do not trigger `on: push: tags` workflows.
