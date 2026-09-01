@@ -32,8 +32,9 @@ class BinaryFile:
         self.is_open = True
         # Read-ahead: bytes already fetched for [pos, pos + len(pending)).
         self.pending = b""
-        # Latched off the first time the fast path reports the filesystem has
-        # no FMODE_NOWAIT, so tmpfs pays one doomed syscall per file, not per read.
+        # Latched off once a probe shows RWF_NOWAIT reads can never succeed on
+        # this file (no FMODE_NOWAIT, as on tmpfs), so such files pay one doomed
+        # syscall per file rather than per read.
         self.fast = True
         # Last size this object observed; a heuristic, never a correctness input.
         self.size_hint = size
@@ -62,8 +63,11 @@ class BinaryFile:
         """One positional read, page-cache fast path first.
 
         `try_read` serves pages that are already resident on this thread and
-        returns None only when the read would have to block -- which is the
-        one case that is worth a kernel submission and a completion hop.
+        returns None whenever the fast path does not apply: the data is not
+        resident and the read would have to block, the filesystem refuses
+        RWF_NOWAIT, or the position does not fit the kernel's off_t. Every None
+        falls back to a kernel submission and a completion hop, and a refused
+        RWF_NOWAIT also latches the fast path off for this file.
         """
         data = _turbofile.try_read(self.fd, pos, size) if self.fast else None
         if data is None:

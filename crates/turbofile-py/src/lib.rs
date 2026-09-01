@@ -574,7 +574,9 @@ fn try_read(py: Python<'_>, fd: i32, pos: u64, len: usize) -> PyResult<Option<Py
             iov_base: unsafe { base.add(filled) } as *mut libc::c_void,
             iov_len: len - filled,
         };
-        let off = (pos + filled as u64) as libc::off_t;
+        let Some(off) = nowait_offset(pos, filled) else {
+            return Ok(None);
+        };
         // Safety: `iov` describes live memory owned by `bytes` for this call.
         let n = unsafe { libc::preadv2(fd, &iov, 1, off, RWF_NOWAIT) };
         if n < 0 {
@@ -625,7 +627,9 @@ fn try_readinto(fd: i32, pos: u64, buffer: Bound<'_, PyAny>) -> PyResult<Option<
             iov_base: unsafe { base.add(filled) } as *mut libc::c_void,
             iov_len: len - filled,
         };
-        let off = (pos + filled as u64) as libc::off_t;
+        let Some(off) = nowait_offset(pos, filled) else {
+            return Ok(None);
+        };
         // Safety: as above; `preadv2` returns before `buffer` is released.
         let n = unsafe { libc::preadv2(fd, &iov, 1, off, RWF_NOWAIT) };
         if n < 0 {
@@ -644,9 +648,11 @@ fn try_readinto(fd: i32, pos: u64, buffer: Bound<'_, PyAny>) -> PyResult<Option<
     Ok(Some(filled))
 }
 
-/// Whether this file supports `RWF_NOWAIT` at all. Filesystems that set no
-/// `FMODE_NOWAIT` (tmpfs among them) fail every attempt with `EOPNOTSUPP`, so
-/// the caller latches this once instead of paying a doomed syscall per read.
+/// Whether a `RWF_NOWAIT` read can ever succeed on this file. Only a completed
+/// probe (a byte, or EOF) or `EAGAIN` proves it. Filesystems that set no
+/// `FMODE_NOWAIT` (tmpfs among them) answer `EOPNOTSUPP`, and any other error
+/// belongs to the async path, which is authoritative for reporting it. The
+/// caller latches the answer once instead of paying a doomed syscall per read.
 #[cfg(target_os = "linux")]
 #[pyfunction]
 fn fast_read_supported(fd: i32) -> bool {
@@ -658,10 +664,18 @@ fn fast_read_supported(fd: i32) -> bool {
         iov_base: &mut byte as *mut u8 as *mut libc::c_void,
         iov_len: 1,
     };
-    // Safety: `iov` describes one live stack byte for the duration of the call.
-    let n = unsafe { libc::preadv2(fd, &iov, 1, 0, RWF_NOWAIT) };
-    // EAGAIN means "supported, just not resident"; only EOPNOTSUPP rules it out.
-    n >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP)
+    loop {
+        // Safety: `iov` describes one live stack byte for the duration of the call.
+        let n = unsafe { libc::preadv2(fd, &iov, 1, 0, RWF_NOWAIT) };
+        if n >= 0 {
+            return true;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// `openat2` resolve flag: fail with `EAGAIN` rather than perform any I/O to
@@ -733,6 +747,14 @@ fn try_read_all(py: Python<'_>, fd: i32, pos: u64) -> PyResult<Option<PyObject>>
     Ok(Some(bytes.into_any().unbind()))
 }
 
+/// Kernel offset for `pos + filled`, or `None` when the caller-supplied
+/// position does not fit `off_t`. A plain cast would wrap negative and lean on
+/// the kernel's `EINVAL` to reach the fallback; declining here keeps it explicit.
+#[cfg(target_os = "linux")]
+fn nowait_offset(pos: u64, filled: usize) -> Option<libc::off_t> {
+    libc::off_t::try_from(pos.checked_add(filled as u64)?).ok()
+}
+
 /// Fill `[base, base + len)` from `fd` at `pos` using page-cache-only reads.
 /// `None` means some part would have blocked, or the file ended early.
 ///
@@ -746,7 +768,7 @@ unsafe fn nowait_fill(fd: i32, pos: u64, base: *mut u8, len: usize) -> Option<us
             iov_base: base.add(filled) as *mut libc::c_void,
             iov_len: len - filled,
         };
-        let off = (pos + filled as u64) as libc::off_t;
+        let off = nowait_offset(pos, filled)?;
         let n = libc::preadv2(fd, &iov, 1, off, RWF_NOWAIT);
         if n < 0 {
             match io::Error::last_os_error().raw_os_error() {

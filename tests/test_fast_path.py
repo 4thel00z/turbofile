@@ -13,6 +13,7 @@ takes the inline path -- so running both is what proves the two routes agree.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,46 @@ async def test_uncached_file_still_correct(workdir: Path) -> None:
     assert await turbofile.read_bytes(p) == payload
     async with turbofile.open(p, "rb") as f:
         assert await f.read() == payload
+
+
+def test_try_read_declines_positions_beyond_off_t(workdir: Path) -> None:
+    """A position past i64::MAX must not reach the kernel as a wrapped offset."""
+    p = workdir / "offset.bin"
+    p.write_bytes(b"0123456789")
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        assert _turbofile.try_read(fd, 2**63, 4) is None
+        assert _turbofile.try_readinto(fd, 2**63, bytearray(4)) is None
+    finally:
+        os.close(fd)
+
+
+def test_fast_read_supported_declines_a_directory(workdir: Path) -> None:
+    """Only a completed probe or EAGAIN proves support; EISDIR does not."""
+    fd = os.open(workdir, os.O_RDONLY)
+    try:
+        assert _turbofile.fast_read_supported(fd) is False
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RWF_NOWAIT is Linux-only")
+@pytest.mark.asyncio
+async def test_fast_path_stays_latched_on_for_the_repo_filesystem() -> None:
+    """Parity holds on either route, so this is what proves the inline one is taken."""
+    REPO_TARGET.mkdir(parents=True, exist_ok=True)
+    p = REPO_TARGET / "latched.bin"
+    p.write_bytes(b"x" * 8192)
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        assert _turbofile.fast_read_supported(fd) is True
+    finally:
+        os.close(fd)
+    async with turbofile.open(p, "rb") as f:
+        assert await f.read(100) == b"x" * 100
+        await f.seek(4096)
+        assert await f.read() == b"x" * 4096
+        assert f.fast is True
 
 
 @pytest.mark.asyncio
