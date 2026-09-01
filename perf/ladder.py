@@ -121,7 +121,7 @@ def build_rungs(fx: Fixture) -> dict[str, Callable[[], Awaitable[object]]]:
 
     async def try_read() -> object:
         # The page-cache fast path on its own: no future, no hop.
-        return _turbofile.try_read(fx.fd, 0, SIZE)
+        return fx.bf.fast.read(0, SIZE) if fx.bf.fast else None
 
     async def file_read() -> object:
         # What an application actually calls, through BinaryFile.
@@ -132,7 +132,7 @@ def build_rungs(fx: Fixture) -> dict[str, Callable[[], Awaitable[object]]]:
         # io_uring_enter, no channel and no doorbell.
         return _turbofile.probe_inline_read(fx.fd, SIZE)
 
-    return {
+    rungs: dict[str, Callable[[], Awaitable[object]]] = {
         "py_coro": py_coro,
         "ffi": ffi,
         "future": future,
@@ -140,10 +140,12 @@ def build_rungs(fx: Fixture) -> dict[str, Callable[[], Awaitable[object]]]:
         "pread": pread,
         "read": read,
         "read_bytes": read_bytes,
-        "inline_read": inline_read,
         "try_read": try_read,
         "file_read": file_read,
     }
+    if hasattr(_turbofile, "probe_inline_read"):
+        rungs["inline_read"] = inline_read
+    return rungs
 
 
 # Rungs that form the additive chain; `pread` is a reference floor, not a layer.

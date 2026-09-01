@@ -55,16 +55,28 @@ Large sequential transfers are memory-bandwidth-bound in the page cache, so
 every implementation converges there; turbofile wins where per-op overhead and
 concurrency dominate, which is what an asyncio application actually does.
 
-On Linux, reads whose pages are already resident are served inline on the
-event-loop thread with `preadv2(RWF_NOWAIT)` — no submission, no driver-thread
-hop, no completion wakeup — falling back to async submission when the kernel
-says the read would block. Page-cache-hot 4 KiB reads on ext4:
+Reads whose pages are already resident are served inline on the event-loop
+thread — no submission, no driver-thread hop, no completion wakeup — falling
+back to async submission when the data is not resident. On Linux the kernel
+decides, through `preadv2(RWF_NOWAIT)`; on macOS `mincore` on a mapping of the
+file reports which pages the buffer cache holds, and a plain `pread` copies
+them. Page-cache-hot 4 KiB reads:
 
-| operation                | before  | after   |         |
+| Linux, ext4              | before  | after   |         |
 | ------------------------ | ------- | ------- | ------- |
 | `open` + `read(n)`       | 44.3 us | 1.30 us | **34x** |
 | `read_bytes`             | 73.1 us | 5.28 us | **14x** |
 | blocking `pread` (floor) | 1.08 us |         |         |
+
+| macOS, APFS                | before  | after   |         |
+| -------------------------- | ------- | ------- | ------- |
+| `read(n)` on an open file  | 38.0 us | 1.12 us | **34x** |
+| blocking `pread` (floor)   | 0.59 us |         |         |
+
+`read_bytes` keeps the async path on macOS. Darwin has no cached-only `open`,
+and an inline `open` there stalls on cold paths and endpoint-security scans
+(about 300 us for the first open of a file on a machine running Jamf Protect),
+so its open and close still cross the driver thread.
 
 Benchmark on a real filesystem: tmpfs sets no `FMODE_NOWAIT`, which disables
 the fast path and makes io_uring punt every read to a kernel worker, so `/tmp`
