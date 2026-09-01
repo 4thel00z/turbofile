@@ -1,8 +1,28 @@
-# turbofile
+<h1 align="center">turbofile</h1>
 
-Real async file I/O for Python. A Rust core drives the best completion
-mechanism each OS has — io_uring on Linux, POSIX AIO on macOS — behind an
-aiofiles-compatible `asyncio` API.
+<p align="center">
+  <b>Real async file I/O for Python.</b><br>
+  A Rust core drives the best completion mechanism each OS has (io_uring on
+  Linux, POSIX AIO on macOS) behind an aiofiles-compatible <code>asyncio</code> API.
+</p>
+
+<p align="center">
+  <a href="https://github.com/4thel00z/turbofile/actions/workflows/ci.yaml"><img src="https://github.com/4thel00z/turbofile/actions/workflows/ci.yaml/badge.svg?branch=master" alt="CI"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue" alt="Python 3.12+"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/core-rust-orange" alt="Rust core"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0"></a>
+</p>
+
+<p align="center">
+  <a href="#installation">Installation</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#benchmarks">Benchmarks</a> ·
+  <a href="#backends">Backends</a> ·
+  <a href="#limitations">Limitations</a> ·
+  <a href="#development">Development</a>
+</p>
+
+---
 
 Existing Python async-file libraries dispatch every call to a thread pool.
 turbofile submits the I/O to the kernel and completes your `await` when the
@@ -16,7 +36,19 @@ kernel says the data moved:
 - **Parallel large reads.** Read-all on a large file is split into chunks
   filled concurrently into one buffer.
 - **Whole-file ops.** `read_bytes`/`write_bytes` do open+read/write+close as a
-  single submission — one round trip per file.
+  single submission: one round trip per file.
+
+## Installation
+
+First release pending; until it's on PyPI, build from source:
+
+```
+git clone https://github.com/4thel00z/turbofile
+cd turbofile
+make develop   # uv + maturin, builds the extension into the venv
+```
+
+## Usage
 
 ```python
 import turbofile
@@ -73,9 +105,10 @@ or as an escape hatch). Windows (IOCP via compio) is planned.
 - `opener=` and integer file descriptors are not supported.
 - `read_bytes` on very large files pays one buffer copy; prefer
   `open(...).read()` for multi-megabyte files.
-- Cancelling an `await` detaches the future; the kernel op still completes
-  (and, for `readinto`, may still write into the buffer) — standard
-  completion-model semantics.
+- A submitted kernel op cannot be recalled, so cancelling an `await` waits for
+  it: the `CancelledError` is delivered when the op completes, and your buffer
+  is never touched after the `await` raises. Cancellation is therefore not
+  prompt; an op that never completes blocks it.
 
 ## Development
 
