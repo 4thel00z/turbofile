@@ -227,6 +227,7 @@ async fn execute(
             file.close().await?;
             Ok(Reply::Written { n, end: n as u64 })
         }
+        Op::Nop => Ok(Reply::Unit),
     }
 }
 

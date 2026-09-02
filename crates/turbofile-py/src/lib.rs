@@ -19,6 +19,11 @@ use pyo3::BoundObject;
 
 use turbofile_core::{is_cancelled, BackendKind, Dest, Driver, Op, OpenSpec, Payload, Reply};
 
+mod fast_path;
+
+#[cfg(target_os = "linux")]
+use fast_path::RWF_NOWAIT;
+
 /// Cleared by `shutdown()` (registered with atexit): once the interpreter is
 /// finalizing, driver-thread completions must never attach to Python again.
 static ALIVE: AtomicBool = AtomicBool::new(true);
@@ -26,6 +31,13 @@ static ALIVE: AtomicBool = AtomicBool::new(true);
 static GET_RUNNING_LOOP: GILOnceCell<PyObject> = GILOnceCell::new();
 
 static KERNEL_FUTURE: GILOnceCell<PyObject> = GILOnceCell::new();
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Private ring owned by `probe_inline_read`, never shared with the driver.
+    static PROBE_RING: std::cell::RefCell<Option<io_uring::IoUring>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// `cancel()` forwards an abort request for the future's kernel ops (their
 /// ids sit in `op_ids`) and returns False: the future settles when the ops
@@ -585,6 +597,92 @@ fn write_file(py: Python<'_>, path: PathBuf, data: Bound<'_, PyAny>) -> PyResult
     )
 }
 
+/// Calibration probe: a page-cache-only positional read on the *calling*
+/// thread. Returns EAGAIN instead of blocking when the data is not resident,
+/// which is what makes it safe to attempt from an event loop. This is the
+/// floor of the fast path the ladder argues for.
+#[cfg(target_os = "linux")]
+#[pyfunction]
+fn probe_pread_nowait(py: Python<'_>, fd: i32, len: usize) -> PyResult<PyObject> {
+    let bytes = PyBytes::new_with(py, len, |_| Ok(()))?;
+    let iov = libc::iovec {
+        iov_base: bytes.as_bytes().as_ptr() as *mut libc::c_void,
+        iov_len: len,
+    };
+    // Safety: `bytes` owns `len` bytes and outlives this synchronous call.
+    let n = unsafe { libc::preadv2(fd, &iov, 1, 0, RWF_NOWAIT) };
+    if n < 0 {
+        return Err(io_err_to_pyerr(io::Error::last_os_error()));
+    }
+    Ok(bytes.into_any().unbind())
+}
+
+/// Calibration probe: one io_uring read submitted and reaped on the *calling*
+/// thread inside a single `io_uring_enter`. No channel, no driver thread, no
+/// doorbell. This is what the ladder's `read` rung would cost if the thread
+/// hop were removed, so it is the floor any redesign is measured against.
+#[cfg(target_os = "linux")]
+#[pyfunction]
+fn probe_inline_read(py: Python<'_>, fd: i32, len: usize) -> PyResult<PyObject> {
+    use io_uring::{opcode, types};
+    let bytes = PyBytes::new_with(py, len, |_| Ok(()))?;
+    let ptr = bytes.as_bytes().as_ptr() as *mut u8;
+    PROBE_RING.with(|cell| -> PyResult<()> {
+        let mut guard = cell.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(io_uring::IoUring::new(64).map_err(io_err_to_pyerr)?);
+        }
+        let ring = guard.as_mut().expect("ring initialised above");
+        let sqe = opcode::Read::new(types::Fd(fd), ptr, len as u32)
+            .offset(0)
+            .build()
+            .user_data(1);
+        // Safety: `bytes` owns the buffer and outlives the wait below, which
+        // does not return until the kernel has finished with it.
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .map_err(|_| PyRuntimeError::new_err("probe submission queue full"))?;
+        }
+        ring.submit_and_wait(1).map_err(io_err_to_pyerr)?;
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| PyRuntimeError::new_err("probe completion missing"))?;
+        match cqe.result() {
+            n if n < 0 => Err(io_err_to_pyerr(io::Error::from_raw_os_error(-n))),
+            _ => Ok(()),
+        }
+    })?;
+    Ok(bytes.into_any().unbind())
+}
+
+/// Calibration probe: pyo3 entry and return, nothing else. Establishes the
+/// FFI floor for the latency ladder.
+#[pyfunction]
+fn probe_ffi() -> u64 {
+    0
+}
+
+/// Calibration probe: an asyncio future created and resolved on the calling
+/// thread, never touching the driver. Isolates future machinery from the
+/// completion bridge.
+#[pyfunction]
+fn probe_resolved_future(py: Python<'_>) -> PyResult<PyObject> {
+    let bridge = bridge_for_running_loop(py)?;
+    let fut = bridge.event_loop.bind(py).call_method0("create_future")?;
+    fut.call_method1("set_result", (py.None(),))?;
+    Ok(fut.unbind())
+}
+
+/// Calibration probe: a full submit -> driver thread -> doorbell -> drain
+/// round trip that performs no kernel work. Measured against
+/// `probe_resolved_future` this is the bridge's own per-op cost.
+#[pyfunction]
+fn probe_nop(py: Python<'_>) -> PyResult<PyObject> {
+    submit(py, Op::Nop, Output::Plain, None)
+}
+
 #[pyfunction]
 fn backend_name() -> PyResult<&'static str> {
     Ok(driver()?.backend_label())
@@ -599,6 +697,8 @@ fn shutdown() {
 fn _turbofile(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;
+    m.add_class::<fast_path::FastPath>()?;
+    m.add_function(wrap_pyfunction!(fast_path::try_read_file, m)?)?;
     m.add_function(wrap_pyfunction!(read_parallel, m)?)?;
     m.add_function(wrap_pyfunction!(read_to_end, m)?)?;
     m.add_function(wrap_pyfunction!(readinto, m)?)?;
@@ -610,6 +710,13 @@ fn _turbofile(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_file, m)?)?;
     m.add_function(wrap_pyfunction!(cancel_ops, m)?)?;
+    #[cfg(target_os = "linux")]
+    m.add_function(wrap_pyfunction!(probe_inline_read, m)?)?;
+    #[cfg(target_os = "linux")]
+    m.add_function(wrap_pyfunction!(probe_pread_nowait, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_ffi, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_resolved_future, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_nop, m)?)?;
     m.add_function(wrap_pyfunction!(backend_name, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
     Ok(())

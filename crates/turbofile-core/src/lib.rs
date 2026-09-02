@@ -133,6 +133,10 @@ pub enum Op {
         path: PathBuf,
         data: Payload,
     },
+    /// Calibration probe: no kernel work and no file-table access. Isolates
+    /// the submit channel, the driver-thread hop and the completion doorbell
+    /// from the cost of the I/O itself.
+    Nop,
 }
 
 #[derive(Debug)]

@@ -32,6 +32,10 @@ class BinaryFile:
         self.is_open = True
         # Read-ahead: bytes already fetched for [pos, pos + len(pending)).
         self.pending = b""
+        # Per-file page-cache fast path; None once a probe shows it can never
+        # apply to this file (no FMODE_NOWAIT on Linux tmpfs, an unmappable
+        # descriptor on macOS), so such files pay one probe rather than one per read.
+        self.fast: Any = _turbofile.FastPath(fd)
         # Last size this object observed; a heuristic, never a correctness input.
         self.size_hint = size
 
@@ -55,6 +59,35 @@ class BinaryFile:
         if not self.info.writable:
             raise io.UnsupportedOperation("not writable")
 
+    def fast_declined(self) -> None:
+        """After a None from the fast path: drop it if it can never apply here."""
+        if self.fast and not self.fast.supported():
+            self.fast = None
+
+    async def read_at(self, pos: int, size: int) -> bytes:
+        """One positional read, page-cache fast path first.
+
+        `FastPath.read` serves pages that are already resident on this thread
+        and returns None whenever the fast path does not apply: the data is not
+        resident and the read would have to block, the file cannot be checked
+        for residency without blocking, or the position does not fit the
+        kernel's off_t. Every None falls back to a kernel submission and a
+        completion hop; a file that can never be served is latched off.
+        """
+        data = self.fast.read(pos, size) if self.fast else None
+        if data is None:
+            self.fast_declined()
+            return await _turbofile.read(self.handle, pos, size)
+        return data
+
+    async def readinto_at(self, pos: int, view: Buffer) -> int:
+        """`readinto` counterpart of `read_at`."""
+        n = self.fast.readinto(pos, view) if self.fast else None
+        if n is None:
+            self.fast_declined()
+            return await _turbofile.readinto(self.handle, pos, view)
+        return n
+
     async def read(self, size: int | None = -1, /) -> bytes:
         self.check_open()
         self.check_readable()
@@ -62,7 +95,10 @@ class BinaryFile:
             start = self.pos + len(self.pending)
             if self.size_hint - start >= LARGE_READ:
                 return await self.read_all_large(start)
-            rest = await _turbofile.read_to_end(self.handle, start)
+            rest = self.fast.read_all(start) if self.fast else None
+            if rest is None:
+                self.fast_declined()
+                rest = await _turbofile.read_to_end(self.handle, start)
             data = self.pending + rest if self.pending else rest
             self.pending = b""
             self.pos += len(data)
@@ -75,9 +111,7 @@ class BinaryFile:
             return data
         head = self.pending
         self.pending = b""
-        rest = await _turbofile.read(
-            self.handle, self.pos + len(head), size - len(head)
-        )
+        rest = await self.read_at(self.pos + len(head), size - len(head))
         data = head + rest if head else rest
         self.pos += len(data)
         return data
@@ -110,7 +144,7 @@ class BinaryFile:
         self.check_readable()
         want = CHUNK if size < 0 else size
         if not self.pending:
-            data = await _turbofile.read(self.handle, self.pos, want)
+            data = await self.read_at(self.pos, want)
             self.pos += len(data)
             return data
         data = self.pending[:want]
@@ -125,7 +159,7 @@ class BinaryFile:
         self.check_open()
         self.check_readable()
         if not self.pending:
-            self.pending = await _turbofile.read(self.handle, self.pos, CHUNK)
+            self.pending = await self.read_at(self.pos, CHUNK)
         return self.pending
 
     async def readline(self, size: int | None = -1, /) -> bytes:
@@ -137,7 +171,7 @@ class BinaryFile:
             parts = [self.pending]
             total = len(self.pending)
             while True:
-                chunk = await _turbofile.read(self.handle, self.pos + total, CHUNK)
+                chunk = await self.read_at(self.pos + total, CHUNK)
                 if not chunk:
                     break
                 found = chunk.find(b"\n")
@@ -174,7 +208,7 @@ class BinaryFile:
         self.check_readable()
         view = memoryview(buffer).cast("B")
         if not self.pending:
-            n = await _turbofile.readinto(self.handle, self.pos, view)
+            n = await self.readinto_at(self.pos, view)
             self.pos += n
             return n
         n = min(len(view), len(self.pending))
@@ -183,7 +217,7 @@ class BinaryFile:
         self.pos += n
         if n == len(view):
             return n
-        rest = await _turbofile.readinto(self.handle, self.pos, view[n:])
+        rest = await self.readinto_at(self.pos, view[n:])
         self.pos += rest
         return n + rest
 
@@ -239,6 +273,7 @@ class BinaryFile:
             return
         self.is_open = False
         self.pending = b""
+        self.fast = None
         await _turbofile.close(self.handle)
 
     async def fileno(self) -> int:

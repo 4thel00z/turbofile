@@ -72,22 +72,48 @@ async iteration, `readinto`, `truncate`, `fsync` via `sync`. Migration is
 
 ## Benchmarks
 
-`make bench` compares against aiofiles on your machine. On an Apple-silicon
-Mac (macOS 26.4, POSIX AIO backend, page-cache-hot files):
+`make bench` compares against aiofiles on your machine: p50 per operation,
+median of three runs. On an Apple-silicon Mac (macOS 26.4, POSIX AIO backend,
+page-cache-hot files, mains power):
 
 | workload                                   | vs aiofiles |
 | ------------------------------------------ | ----------- |
-| 4 KiB whole-file read (`read_bytes`)       | 2.5x        |
-| 32 concurrent 4 KiB random reads           | 15x         |
-| 200 small files read concurrently          | 3.6x        |
+| 4 KiB read on an open file                 | 55x         |
+| 32 concurrent 4 KiB random reads           | 16x         |
+| 200 small files read concurrently          | 3.9x        |
+| 4 KiB whole-file read (`read_bytes`)       | 2.1x        |
 | 8 MiB whole-file read (`open` + `read`)    | 1.0x        |
 | 8 MiB sequential write (1 MiB chunks)      | 1.0x        |
 
 Large sequential transfers are memory-bandwidth-bound in the page cache, so
 every implementation converges there; turbofile wins where per-op overhead and
-concurrency dominate, which is what an asyncio application actually does.
-io_uring numbers on Linux come from CI; run `make bench` there for your
-hardware.
+concurrency dominate, which is what an asyncio application does.
+
+Reads whose pages are already resident never leave the event-loop thread: no
+submission, no driver-thread hop, no completion wakeup. On Linux the kernel
+decides, through `preadv2(RWF_NOWAIT)`; on macOS `mincore` on a mapping of the
+file reports which pages the buffer cache holds, and a plain `pread` copies
+them. Data that is not resident takes the async path. `make ladder` isolates
+that read: its `file_read` rung is `BinaryFile`'s positional read of a hot
+4 KiB, its `pread` rung the blocking syscall for the same bytes.
+
+| platform    | `file_read` | `pread` |
+| ----------- | ----------- | ------- |
+| Linux, ext4 | 1.3 us      | 1.1 us  |
+| macOS, APFS | 1.1 us      | 0.6 us  |
+
+On Linux `read_bytes` takes the same inline route for the whole file, open
+included, through `openat2(RESOLVE_CACHED)`: 5.3 us for a hot 4 KiB file. macOS
+has no cached-only `open`, and an inline `open` there stalls on cold paths and
+endpoint-security scans (about 300 us for the first open of a file on a machine
+running Jamf Protect), so `read_bytes` keeps its open and close on the driver
+thread.
+
+Benchmark on a real filesystem: tmpfs sets no `FMODE_NOWAIT`, which disables
+the fast path and makes io_uring punt every read to a kernel worker, so `/tmp`
+numbers are not comparable. `make bench` and `make ladder` take `FS=<dir>` and
+print which filesystem they measured. See `perf/README.md` for the analysis
+harness.
 
 ## Backends
 

@@ -208,6 +208,7 @@ impl Driver {
 
     fn handle_op(&mut self, id: u64, op: Op, cb: Callback) {
         match op {
+            Op::Nop => cb(Ok(Reply::Unit)),
             Op::Open { path, spec } => cb(self.open(&path, &spec)),
             Op::Close { handle } => self.close(handle, cb),
             Op::Size { handle } => cb(self
