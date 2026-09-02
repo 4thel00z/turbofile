@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/4thel00z/turbofile/compare/v0.1.1...v0.1.2) (2026-09-01)
+
+
+### Documentation
+
+* state current benchmark numbers only; bench an open-file read ([218fd5a](https://github.com/4thel00z/turbofile/commit/218fd5a3731944225477dcf51b2ec1dd487239d8))
+
 ## [0.1.1](https://github.com/4thel00z/turbofile/compare/v0.1.0...v0.1.1) (2026-09-01)
 
 

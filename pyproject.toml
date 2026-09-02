@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "turbofile"
-version = "0.1.1"
+version = "0.1.2"
 description = "Real async file I/O for Python: io_uring, IOCP and POSIX AIO via Rust, with an aiofiles-compatible API"
 readme = "README.md"
 requires-python = ">=3.12"
