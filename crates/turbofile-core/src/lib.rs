@@ -3,12 +3,29 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod compio_backend;
 #[cfg(target_os = "macos")]
 mod darwin_aio;
 
 pub type Callback = Box<dyn FnOnce(io::Result<Reply>) + Send + 'static>;
+
+/// The error an op settles with when its cancel request won.
+#[cfg(unix)]
+pub fn cancelled_error() -> io::Error {
+    io::Error::from_raw_os_error(libc::ECANCELED)
+}
+
+#[cfg(unix)]
+pub fn is_cancelled(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECANCELED)
+}
+
+pub(crate) enum Msg {
+    Submit { id: u64, op: Op, cb: Callback },
+    Cancel { id: u64 },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -133,7 +150,8 @@ pub enum Reply {
 }
 
 pub struct Driver {
-    tx: flume::Sender<(Op, Callback)>,
+    tx: flume::Sender<Msg>,
+    next_op: AtomicU64,
     label: &'static str,
 }
 
@@ -148,7 +166,11 @@ impl Driver {
                 "darwin-aio"
             }
         };
-        Ok(Self { tx, label })
+        Ok(Self {
+            tx,
+            next_op: AtomicU64::new(1),
+            label,
+        })
     }
 
     /// The I/O mechanism actually driving this backend (e.g. the compio
@@ -157,13 +179,26 @@ impl Driver {
         self.label
     }
 
-    pub fn submit(&self, op: Op, cb: Callback) {
-        if let Err(flume::SendError((_, cb))) = self.tx.send((op, cb)) {
+    /// Returns the op's id, the token [`Driver::cancel`] takes.
+    pub fn submit(&self, op: Op, cb: Callback) -> u64 {
+        let id = self.next_op.fetch_add(1, Ordering::Relaxed);
+        if let Err(flume::SendError(Msg::Submit { cb, .. })) =
+            self.tx.send(Msg::Submit { id, op, cb })
+        {
             cb(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "turbofile driver thread is gone",
             )));
         }
+        id
+    }
+
+    /// Best-effort abort of an in-flight op: a queued op settles ECANCELED,
+    /// a submitted one is cancelled where the backend can (aio_cancel on
+    /// macOS; compio aborts before the next chunk). An op the kernel already
+    /// completed delivers its result.
+    pub fn cancel(&self, id: u64) {
+        self.tx.send(Msg::Cancel { id }).ok();
     }
 }
 

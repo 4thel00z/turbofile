@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::mem::MaybeUninit;
@@ -9,9 +9,15 @@ use compio::driver::AsRawFd;
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAt, AsyncReadAtExt, AsyncWriteAtExt};
 
-use crate::{bad_handle, Callback, Dest, Op, OpenSpec, Payload, Reply};
+use crate::{bad_handle, cancelled_error, Dest, Msg, Op, OpenSpec, Payload, Reply};
 
 type Files = Rc<RefCell<HashMap<u64, File>>>;
+
+/// Cancel flags of ops still executing, keyed by op id. compio owns each
+/// submitted kernel op's buffer through its own cancellation, so aborting
+/// mid-op cannot release the caller's memory safely; the flag is honored
+/// before the op starts and between chunks instead.
+type CancelFlags = Rc<RefCell<HashMap<u64, Rc<Cell<bool>>>>>;
 
 impl IoBuf for Payload {
     fn as_init(&self) -> &[u8] {
@@ -47,7 +53,7 @@ impl IoBufMut for RawBufMut {
     }
 }
 
-pub(crate) fn spawn(rx: flume::Receiver<(Op, Callback)>) -> io::Result<&'static str> {
+pub(crate) fn spawn(rx: flume::Receiver<Msg>) -> io::Result<&'static str> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("turbofile-compio".into())
@@ -78,10 +84,20 @@ pub(crate) fn spawn(rx: flume::Receiver<(Op, Callback)>) -> io::Result<&'static 
     }
 }
 
-async fn run(rx: flume::Receiver<(Op, Callback)>) {
+async fn run(rx: flume::Receiver<Msg>) {
     let files: Files = Rc::new(RefCell::new(HashMap::new()));
+    let cancel_flags: CancelFlags = Rc::new(RefCell::new(HashMap::new()));
     let mut next_id: u64 = 1;
-    while let Ok((op, cb)) = rx.recv_async().await {
+    while let Ok(msg) = rx.recv_async().await {
+        let (id, op, cb) = match msg {
+            Msg::Cancel { id } => {
+                if let Some(flag) = cancel_flags.borrow().get(&id) {
+                    flag.set(true);
+                }
+                continue;
+            }
+            Msg::Submit { id, op, cb } => (id, op, cb),
+        };
         let open_id = match &op {
             Op::Open { .. } => {
                 next_id += 1;
@@ -89,15 +105,28 @@ async fn run(rx: flume::Receiver<(Op, Callback)>) {
             }
             _ => None,
         };
+        let cancelled = Rc::new(Cell::new(false));
+        cancel_flags.borrow_mut().insert(id, cancelled.clone());
         let files = files.clone();
+        let cancel_flags = cancel_flags.clone();
         compio::runtime::spawn(async move {
-            cb(execute(op, open_id, files).await);
+            let result = execute(op, open_id, files, &cancelled).await;
+            cancel_flags.borrow_mut().remove(&id);
+            cb(result);
         })
         .detach();
     }
 }
 
-async fn execute(op: Op, open_id: Option<u64>, files: Files) -> io::Result<Reply> {
+async fn execute(
+    op: Op,
+    open_id: Option<u64>,
+    files: Files,
+    cancelled: &Cell<bool>,
+) -> io::Result<Reply> {
+    if cancelled.get() {
+        return Err(cancelled_error());
+    }
     match op {
         Op::Open { path, spec } => {
             let file = open_options(&spec).open(&path).await?;
@@ -111,7 +140,8 @@ async fn execute(op: Op, open_id: Option<u64>, files: Files) -> io::Result<Reply
             let file = lookup(&files, handle)?;
             match dest {
                 Dest::Alloc { len } => {
-                    let (_, buf) = read_up_to(&file, pos, len, Vec::with_capacity(len)).await?;
+                    let (_, buf) =
+                        read_up_to(&file, pos, len, Vec::with_capacity(len), cancelled).await?;
                     Ok(Reply::Bytes(buf))
                 }
                 Dest::Into { ptr, len } => {
@@ -120,7 +150,7 @@ async fn execute(op: Op, open_id: Option<u64>, files: Files) -> io::Result<Reply
                         cap: len,
                         len: 0,
                     };
-                    let (n, _) = read_up_to(&file, pos, len, raw).await?;
+                    let (n, _) = read_up_to(&file, pos, len, raw, cancelled).await?;
                     Ok(Reply::Read { n })
                 }
             }
@@ -237,15 +267,20 @@ async fn append_all(file: &File, data: Payload) -> io::Result<()> {
     res
 }
 
-/// Read up to `len` bytes from `pos`, stopping early only at EOF. The buffer
-/// fills from its current initialized length.
+/// Read up to `len` bytes from `pos`, stopping early only at EOF or a cancel
+/// request between chunks. The buffer fills from its current initialized
+/// length.
 async fn read_up_to<B: IoBufMut + 'static>(
     file: &File,
     pos: u64,
     len: usize,
     mut buf: B,
+    cancelled: &Cell<bool>,
 ) -> io::Result<(usize, B)> {
     loop {
+        if cancelled.get() {
+            return Err(cancelled_error());
+        }
         let filled = buf.buf_len();
         if filled >= len {
             return Ok((filled, buf));

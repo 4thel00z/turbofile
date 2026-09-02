@@ -14,10 +14,10 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use pyo3::BoundObject;
 
-use turbofile_core::{BackendKind, Dest, Driver, Op, OpenSpec, Payload, Reply};
+use turbofile_core::{is_cancelled, BackendKind, Dest, Driver, Op, OpenSpec, Payload, Reply};
 
 mod fast_path;
 
@@ -30,11 +30,34 @@ static ALIVE: AtomicBool = AtomicBool::new(true);
 
 static GET_RUNNING_LOOP: GILOnceCell<PyObject> = GILOnceCell::new();
 
+static KERNEL_FUTURE: GILOnceCell<PyObject> = GILOnceCell::new();
+
 #[cfg(target_os = "linux")]
 thread_local! {
     /// Private ring owned by `probe_inline_read`, never shared with the driver.
     static PROBE_RING: std::cell::RefCell<Option<io_uring::IoUring>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// `cancel()` forwards an abort request for the future's kernel ops (their
+/// ids sit in `op_ids`) and returns False: the future settles when the ops
+/// do, promptly on abort, so caller buffers are never touched after the
+/// `await` raises. `deliver` turns an ECANCELED settle into a real
+/// cancellation via `settle_cancelled`.
+fn kernel_future_class(py: Python<'_>) -> PyResult<&'static PyObject> {
+    KERNEL_FUTURE.get_or_try_init(py, || {
+        let ns = PyDict::new(py);
+        ns.set_item("cancel_kernel_ops", wrap_pyfunction!(cancel_ops, py)?)?;
+        py.run(
+            c"import asyncio\n\nclass KernelFuture(asyncio.Future):\n    \"\"\"Completion of in-flight kernel ops; cancel() requests their abort.\"\"\"\n\n    def cancel(self, msg: object = None) -> bool:\n        if self.done():\n            return False\n        cancel_kernel_ops(self.op_ids)\n        return False\n\n    def settle_cancelled(self) -> bool:\n        return super().cancel()\n",
+            Some(&ns),
+            Some(&ns),
+        )?;
+        let class = ns
+            .get_item("KernelFuture")?
+            .ok_or_else(|| PyRuntimeError::new_err("KernelFuture class not defined"))?;
+        Ok(class.unbind())
+    })
 }
 
 struct Globals {
@@ -106,6 +129,8 @@ struct LoopBridge {
     armed: AtomicBool,
     event_loop: PyObject,
     call_soon_threadsafe: PyObject,
+    /// `functools.partial(KernelFuture, loop=event_loop)`.
+    create_future: PyObject,
     drain: OnceLock<PyObject>,
 }
 
@@ -182,6 +207,9 @@ fn deliver(py: Python<'_>, completion: Completion) {
         .unwrap_or(true);
     if !done {
         match result {
+            Err(e) if is_cancelled(&e) => {
+                fut.call_method0("settle_cancelled").ok();
+            }
             Err(e) => {
                 let exc = io_err_to_pyerr(e).into_value(py);
                 fut.call_method1("set_exception", (exc,)).ok();
@@ -255,11 +283,20 @@ fn bridge_for_running_loop(py: Python<'_>) -> PyResult<Arc<LoopBridge>> {
             .map(|closed| !closed)
             .unwrap_or(false)
     });
+    let class = kernel_future_class(py)?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("loop", &event_loop)?;
+    let create_future = py
+        .import("functools")?
+        .getattr("partial")?
+        .call((class.bind(py),), Some(&kwargs))?
+        .unbind();
     let bridge = Arc::new(LoopBridge {
         key,
         queue: Mutex::new(Vec::new()),
         armed: AtomicBool::new(false),
         call_soon_threadsafe: event_loop.getattr("call_soon_threadsafe")?.unbind(),
+        create_future,
         event_loop: event_loop.unbind(),
         drain: OnceLock::new(),
     });
@@ -280,13 +317,9 @@ fn bridge_for_running_loop(py: Python<'_>) -> PyResult<Arc<LoopBridge>> {
 fn submit(py: Python<'_>, op: Op, output: Output, owner: Option<Owner>) -> PyResult<PyObject> {
     let driver = driver()?;
     let bridge = bridge_for_running_loop(py)?;
-    let fut = bridge
-        .event_loop
-        .bind(py)
-        .call_method0("create_future")?
-        .unbind();
+    let fut = bridge.create_future.bind(py).call0()?.unbind();
     let result_fut = fut.clone_ref(py);
-    driver.submit(
+    let id = driver.submit(
         op,
         Box::new(move |result| {
             bridge.complete(Completion {
@@ -297,6 +330,8 @@ fn submit(py: Python<'_>, op: Op, output: Output, owner: Option<Owner>) -> PyRes
             });
         }),
     );
+    // Same-thread with the GIL held: nothing can read op_ids before this.
+    result_fut.bind(py).setattr("op_ids", (id,))?;
     Ok(result_fut)
 }
 
@@ -423,11 +458,7 @@ fn read_parallel(
     }
     let driver = driver()?;
     let bridge = bridge_for_running_loop(py)?;
-    let fut = bridge
-        .event_loop
-        .bind(py)
-        .call_method0("create_future")?
-        .unbind();
+    let fut = bridge.create_future.bind(py).call0()?.unbind();
     let result_fut = fut.clone_ref(py);
 
     let bytes = PyBytes::new_with(py, len, |_| Ok(()))?;
@@ -444,13 +475,15 @@ fn read_parallel(
         }),
     });
     if len == 0 {
+        result_fut.bind(py).setattr("op_ids", Vec::<u64>::new())?;
         group.chunk_done(0, 0, Ok(Reply::Read { n: 0 }));
         return Ok(result_fut);
     }
+    let mut ids = Vec::with_capacity(chunk_count);
     for start in (0..len).step_by(chunk) {
         let chunk_len = chunk.min(len - start);
         let group = group.clone();
-        driver.submit(
+        ids.push(driver.submit(
             Op::ReadAt {
                 handle,
                 pos: pos + start as u64,
@@ -460,9 +493,21 @@ fn read_parallel(
                 },
             },
             Box::new(move |result| group.chunk_done(start, chunk_len, result)),
-        );
+        ));
     }
+    result_fut.bind(py).setattr("op_ids", ids)?;
     Ok(result_fut)
+}
+
+/// Best-effort abort of the kernel ops behind one future; ops the kernel
+/// already completed deliver their result instead.
+#[pyfunction]
+fn cancel_ops(ops: Vec<u64>) -> PyResult<()> {
+    let driver = driver()?;
+    for id in ops {
+        driver.cancel(id);
+    }
+    Ok(())
 }
 
 #[pyfunction]
@@ -664,6 +709,7 @@ fn _turbofile(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(size, m)?)?;
     m.add_function(wrap_pyfunction!(read_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_file, m)?)?;
+    m.add_function(wrap_pyfunction!(cancel_ops, m)?)?;
     #[cfg(target_os = "linux")]
     m.add_function(wrap_pyfunction!(probe_inline_read, m)?)?;
     #[cfg(target_os = "linux")]

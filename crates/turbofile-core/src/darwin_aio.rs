@@ -8,7 +8,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::{bad_handle, Callback, Dest, Op, OpenSpec, Payload, Reply};
+use crate::{bad_handle, cancelled_error, Callback, Dest, Msg, Op, OpenSpec, Payload, Reply};
 
 /// Upper bound for the `aio_suspend` wait while ops are in flight; newly
 /// submitted ops wait at most this long before the driver notices them.
@@ -18,7 +18,7 @@ const SUSPEND_TIMEOUT_NS: i64 = 1_000_000;
 /// it keeps the pending queue in userspace where it is observable.
 const FALLBACK_MAX_INFLIGHT: usize = 16;
 
-pub(crate) fn spawn(rx: flume::Receiver<(Op, Callback)>) -> io::Result<()> {
+pub(crate) fn spawn(rx: flume::Receiver<Msg>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("turbofile-aio".into())
         .spawn(move || Driver::new(rx).run())?;
@@ -84,6 +84,8 @@ enum JobKind {
 }
 
 struct Job {
+    id: u64,
+    cancelled: bool,
     kind: JobKind,
     cb: Callback,
 }
@@ -94,7 +96,7 @@ struct Inflight {
 }
 
 struct Driver {
-    rx: flume::Receiver<(Op, Callback)>,
+    rx: flume::Receiver<Msg>,
     files: HashMap<u64, FileEntry>,
     next_id: u64,
     inflight: Vec<Inflight>,
@@ -104,7 +106,7 @@ struct Driver {
 }
 
 impl Driver {
-    fn new(rx: flume::Receiver<(Op, Callback)>) -> Self {
+    fn new(rx: flume::Receiver<Msg>) -> Self {
         Self {
             rx,
             files: HashMap::new(),
@@ -123,7 +125,7 @@ impl Driver {
                     return;
                 }
                 match self.rx.recv() {
-                    Ok((op, cb)) => self.handle_op(op, cb),
+                    Ok(msg) => self.handle_msg(msg),
                     Err(_) => return,
                 }
             }
@@ -171,7 +173,7 @@ impl Driver {
     fn drain_channel(&mut self) {
         loop {
             match self.rx.try_recv() {
-                Ok((op, cb)) => self.handle_op(op, cb),
+                Ok(msg) => self.handle_msg(msg),
                 Err(flume::TryRecvError::Empty) => return,
                 Err(flume::TryRecvError::Disconnected) => {
                     self.disconnected = true;
@@ -181,7 +183,30 @@ impl Driver {
         }
     }
 
-    fn handle_op(&mut self, op: Op, cb: Callback) {
+    fn handle_msg(&mut self, msg: Msg) {
+        match msg {
+            Msg::Submit { id, op, cb } => self.handle_op(id, op, cb),
+            Msg::Cancel { id } => self.cancel(id),
+        }
+    }
+
+    /// A queued job settles ECANCELED immediately; an inflight one gets
+    /// `aio_cancel` and is flagged so a surviving chunk is not resubmitted.
+    /// An unknown id already finished: nothing to do.
+    fn cancel(&mut self, id: u64) {
+        if let Some(pos) = self.queue.iter().position(|job| job.id == id) {
+            let job = self.queue.remove(pos).expect("position is in bounds");
+            self.finish(job, Err(cancelled_error()));
+            return;
+        }
+        let Some(entry) = self.inflight.iter_mut().find(|entry| entry.job.id == id) else {
+            return;
+        };
+        entry.job.cancelled = true;
+        unsafe { libc::aio_cancel(entry.aiocb.aio_fildes, &mut *entry.aiocb) };
+    }
+
+    fn handle_op(&mut self, id: u64, op: Op, cb: Callback) {
         match op {
             Op::Nop => cb(Ok(Reply::Unit)),
             Op::Open { path, spec } => cb(self.open(&path, &spec)),
@@ -196,7 +221,12 @@ impl Driver {
                 }
             })),
             Op::Sync { handle, .. } => match self.with_fd(handle) {
-                Ok(fd) => self.enqueue(JobKind::Fsync(FsyncJob { handle, fd }), Some(handle), cb),
+                Ok(fd) => self.enqueue(
+                    id,
+                    JobKind::Fsync(FsyncJob { handle, fd }),
+                    Some(handle),
+                    cb,
+                ),
                 Err(e) => cb(Err(e)),
             },
             Op::ReadAt { handle, pos, dest } => match self.with_fd(handle) {
@@ -223,6 +253,7 @@ impl Driver {
                         }
                     };
                     self.enqueue(
+                        id,
                         JobKind::Read(ReadJob {
                             handle: Some(handle),
                             fd,
@@ -244,6 +275,7 @@ impl Driver {
                         .map(|size| size.saturating_sub(pos) as usize)
                         .unwrap_or(0);
                     self.enqueue(
+                        id,
                         JobKind::Read(ReadJob {
                             handle: Some(handle),
                             fd,
@@ -273,6 +305,7 @@ impl Driver {
                     cb(end.map(|end| Reply::Written { n: 0, end }));
                 }
                 Ok(fd) => self.enqueue(
+                    id,
                     JobKind::Write(WriteJob {
                         handle: Some(handle),
                         fd,
@@ -299,6 +332,7 @@ impl Driver {
                     Ok(fd) => {
                         let hint = fd_size(fd).unwrap_or(0) as usize;
                         self.enqueue(
+                            id,
                             JobKind::Read(ReadJob {
                                 handle: None,
                                 fd,
@@ -327,6 +361,7 @@ impl Driver {
                 );
                 match opened {
                     Ok(fd) => self.enqueue(
+                        id,
                         JobKind::Write(WriteJob {
                             handle: None,
                             fd,
@@ -391,13 +426,18 @@ impl Driver {
         Ok(entry.fd)
     }
 
-    fn enqueue(&mut self, kind: JobKind, handle: Option<u64>, cb: Callback) {
+    fn enqueue(&mut self, id: u64, kind: JobKind, handle: Option<u64>, cb: Callback) {
         if let Some(handle) = handle {
             if let Some(entry) = self.files.get_mut(&handle) {
                 entry.ops += 1;
             }
         }
-        self.queue.push_back(Job { kind, cb });
+        self.queue.push_back(Job {
+            id,
+            cancelled: false,
+            kind,
+            cb,
+        });
         self.submit_ready();
     }
 
@@ -529,10 +569,13 @@ impl Driver {
     }
 
     /// One chunk completed with `n` bytes; either resubmit the remainder or
-    /// finish the job.
+    /// finish the job. A job whose chunk survived its cancel request settles
+    /// ECANCELED instead of resubmitting; a fully completed one keeps its
+    /// result (the op won the race).
     fn advance(&mut self, mut job: Job, n: usize) {
         match step(&mut job, n) {
             Step::Done(reply) => self.finish(job, reply),
+            Step::More if job.cancelled => self.finish(job, Err(cancelled_error())),
             Step::More => {
                 self.queue.push_front(job);
                 self.submit_ready();
