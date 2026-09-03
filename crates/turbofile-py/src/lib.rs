@@ -223,11 +223,7 @@ impl LoopBridge {
         }
         match self.doorbell.get().expect("doorbell set at construction") {
             #[cfg(unix)]
-            Doorbell::Pipe { write_fd, .. } => {
-                // A full pipe already holds a wake, so the result is irrelevant.
-                // Safety: `write_fd` stays open for as long as this bridge lives.
-                unsafe { libc::write(*write_fd, [1u8].as_ptr().cast(), 1) };
-            }
+            Doorbell::Pipe { write_fd, .. } => ring_pipe(*write_fd),
             Doorbell::CallSoon(call_soon_threadsafe) => self.ring_call_soon(call_soon_threadsafe),
         }
     }
@@ -253,13 +249,45 @@ impl LoopBridge {
     fn quiet_doorbell(&self) {
         match self.doorbell.get().expect("doorbell set at construction") {
             #[cfg(unix)]
-            Doorbell::Pipe { read_fd, .. } => {
-                let mut sink = [0u8; 64];
-                // Safety: `sink` has `sink.len()` writable bytes; the read end is non-blocking.
-                while unsafe { libc::read(*read_fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
-            }
+            Doorbell::Pipe { read_fd, .. } => quiet_pipe(*read_fd),
             Doorbell::CallSoon(_) => {}
         }
+    }
+}
+
+#[cfg(unix)]
+fn interrupted() -> bool {
+    io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+}
+
+/// Write the one wake byte. An `EINTR` before it is written is retried, since
+/// the bridge stays armed and nothing else would ring; `EAGAIN` means the pipe
+/// already holds a wake; any other failure means the bridge is gone.
+#[cfg(unix)]
+fn ring_pipe(write_fd: i32) {
+    loop {
+        // Safety: `write_fd` stays open for as long as its bridge lives.
+        let n = unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) };
+        if n >= 0 || !interrupted() {
+            return;
+        }
+    }
+}
+
+/// Read the pipe dry: stop when it is empty (`EAGAIN`) or closed, retry `EINTR`.
+#[cfg(unix)]
+fn quiet_pipe(read_fd: i32) {
+    let mut sink = [0u8; 64];
+    loop {
+        // Safety: `sink` has `sink.len()` writable bytes; the read end is non-blocking.
+        let n = unsafe { libc::read(read_fd, sink.as_mut_ptr().cast(), sink.len()) };
+        if n > 0 {
+            continue;
+        }
+        if n < 0 && interrupted() {
+            continue;
+        }
+        return;
     }
 }
 
