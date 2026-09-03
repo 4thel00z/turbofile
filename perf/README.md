@@ -139,3 +139,32 @@ the median from 65 µs to 17 µs and put every one of those stalls on the event
 loop instead of the driver thread.
 
 `inline_read` needs an io_uring, so the ladder has that rung on Linux only.
+
+### The doorbell
+
+With the fast path serving hot reads, what remained of `bridge` was the wake
+itself. `wake_probe.py` on the same Mac put a bare futex round trip at 7.7 µs
+and a `call_soon_threadsafe` round trip at 28.7 µs, against a `bridge` rung of
+31.4 µs: about 3 µs of the bridge was turbofile's, and the rest was CPython's
+wake path (a socketpair send, a `kevent` return, a self-pipe read, then the
+scheduled handle). A one-byte write to a pipe registered with `add_reader`
+does the same wake in 18.9 µs on the stock loop and 8.0 µs under uvloop, the
+futex floor. It also needs no GIL on the driver thread, where
+`call_soon_threadsafe` could wait a whole switch interval behind a busy loop
+and stall the reaping of every other completion.
+
+Result: `bridge` 31,728 ns → 19,663 ns, `read_bytes` 64,922 ns → 53,998 ns
+per hot 4 KiB file.
+
+### Large reads
+
+`read_parallel` filled an 8 MiB read as 4 × 2 MiB chunks. A chunk sweep
+against Darwin's four kernel AIO threads (`kern.aiothreads`) showed the copy
+throughput peaking with at least sixteen chunks in flight and 512 KiB the
+best size from 8 MiB to 128 MiB: 8 MiB went 0.579 → 0.386 ms, 128 MiB
+6.6 → 5.1 ms against 17.6 ms for a blocking `pread`. Fresh destination
+pages matter too: a single 8 MiB `aio_read` into a never-touched buffer costs
+1.09 ms against 0.78 ms into a resident one, which is the cross-map fault path
+the kernel thread takes. The public read-all also paid two driver round trips
+for its size snapshot and its end-of-file check; both are now an inline
+`fstat`, the same call the fast path already makes.

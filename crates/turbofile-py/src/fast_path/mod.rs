@@ -109,6 +109,13 @@ impl FastPath {
         Ok(Some(bytes.into_any().unbind()))
     }
 
+    /// The file's current size from an inline `fstat`, or `None` for anything
+    /// that is not a regular file. Lets a large read-all skip the driver round
+    /// trips for its size snapshot and its end-of-file check.
+    fn size(&self) -> Option<u64> {
+        self.inner.size()
+    }
+
     /// Whether this file can ever take the fast path. The caller asks once
     /// after a `None` and drops the object when the answer is no, so a file
     /// that can never be served pays one probe rather than one per read.

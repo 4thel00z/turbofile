@@ -14,12 +14,15 @@ CHUNK = 65536
 
 # Above this expected size, read-all switches from the single-op read_to_end
 # (one extra buffer copy) to a size-guided read that the kernel writes straight
-# into the returned bytes object, plus a probe for post-snapshot growth.
+# into the returned bytes object, with a read to true EOF only when the file
+# grew past the snapshot.
 LARGE_READ = 1024 * 1024
 
 # Chunk size for the parallel fill of one large read; parallel chunks spread
-# the page-cache copy across kernel service threads.
-PARALLEL_CHUNK = 2 * 1024 * 1024
+# the page-cache copy across kernel service threads. 512 KiB keeps at least
+# sixteen chunks in flight from 8 MiB up, which is where the copy throughput
+# peaks on Darwin's four AIO threads; smaller chunks lose to per-op cost.
+PARALLEL_CHUNK = 512 * 1024
 
 
 class BinaryFile:
@@ -117,14 +120,14 @@ class BinaryFile:
         return data
 
     async def read_all_large(self, start: int) -> bytes:
-        size_now = await _turbofile.size(self.handle)
+        size_now = await self.current_size()
         remaining = max(size_now - start, 0)
         first = await _turbofile.read_parallel(
             self.handle, start, remaining, PARALLEL_CHUNK
         )
         parts = [self.pending, first] if self.pending else [first]
         offset = start + len(first)
-        if len(first) == remaining:
+        if len(first) == remaining and not self.still_ends_at(size_now):
             # The file may have grown past the size snapshot; read to true EOF.
             while True:
                 probe = await _turbofile.read_to_end(self.handle, offset)
@@ -138,6 +141,19 @@ class BinaryFile:
         if len(parts) == 1:
             return parts[0]
         return b"".join(parts)
+
+    async def current_size(self) -> int:
+        """The file's size now: an inline `fstat` through the fast path, or one
+        driver round trip for a file the fast path cannot describe."""
+        size = self.fast.size() if self.fast else None
+        if size is None:
+            return await _turbofile.size(self.handle)
+        return size
+
+    def still_ends_at(self, size: int) -> bool:
+        """Whether an inline `fstat` shows the file still ending at `size`;
+        False when the fast path cannot tell, so the caller reads to true EOF."""
+        return bool(self.fast) and self.fast.size() == size
 
     async def read1(self, size: int = -1, /) -> bytes:
         self.check_open()

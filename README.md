@@ -31,10 +31,12 @@ kernel says the data moved:
 - **Zero-copy reads and writes.** The kernel fills the `bytes` object your
   `await f.read(n)` returns; writes pin your buffer and hand the kernel its
   pointer. No intermediate copies on the hot paths.
-- **Completion batching.** A burst of completions costs one event-loop wakeup
-  (one `call_soon_threadsafe` doorbell per burst, drained entirely in Rust).
-- **Parallel large reads.** Read-all on a large file is split into chunks
-  filled concurrently into one buffer.
+- **Completion batching.** A burst of completions costs one event-loop wakeup:
+  a byte on a pipe the loop watches, so the driver thread never takes the GIL
+  to wake the loop, and the batch is drained entirely in Rust.
+- **Parallel large reads.** Read-all on a large file is split into 512 KiB
+  chunks filled concurrently into one buffer, which spreads the page-cache
+  copy across the kernel's I/O threads and beats a single blocking `read`.
 - **Whole-file ops.** `read_bytes`/`write_bytes` do open+read/write+close as a
   single submission: one round trip per file.
 
@@ -79,15 +81,18 @@ page-cache-hot files, mains power):
 | workload                                   | vs aiofiles |
 | ------------------------------------------ | ----------- |
 | 4 KiB read on an open file                 | 55x         |
-| 32 concurrent 4 KiB random reads           | 16x         |
-| 200 small files read concurrently          | 3.9x        |
-| 4 KiB whole-file read (`read_bytes`)       | 2.1x        |
-| 8 MiB whole-file read (`open` + `read`)    | 1.0x        |
+| 32 concurrent 4 KiB random reads           | 25x         |
+| 200 small files read concurrently          | 5.0x        |
+| 4 KiB whole-file read (`read_bytes`)       | 2.9x        |
+| 8 MiB whole-file read (`open` + `read`)    | 2.0x        |
 | 8 MiB sequential write (1 MiB chunks)      | 1.0x        |
 
-Large sequential transfers are memory-bandwidth-bound in the page cache, so
-every implementation converges there; turbofile wins where per-op overhead and
-concurrency dominate, which is what an asyncio application does.
+The 8 MiB read finishes in 0.39 ms, under the 0.45 ms a blocking `read` of the
+same bytes takes, because sixteen chunks copy in parallel on the kernel's AIO
+threads. Sequential writes await one chunk at a time, so one copy is in flight
+and every implementation converges on the page-cache copy; turbofile wins where
+per-op overhead and concurrency dominate, which is what an asyncio application
+does.
 
 Reads whose pages are already resident never leave the event-loop thread: no
 submission, no driver-thread hop, no completion wakeup. On Linux the kernel
