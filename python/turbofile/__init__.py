@@ -7,7 +7,7 @@ import os
 from typing import Any
 
 from turbofile import _turbofile
-from turbofile.binary import BinaryFile, FileContext
+from turbofile.binary import LARGE_READ, BinaryFile, FileContext, read_to_eof_parallel
 from turbofile.modes import parse_mode
 from turbofile.text import TextFile, resolve_encoding
 
@@ -82,11 +82,20 @@ async def open_file(
 async def read_bytes(path: Any) -> bytes:
     p = os.fspath(path)
     # Whole file from page cache on this thread when nothing would block;
-    # otherwise one submission does open+read+close on the driver.
+    # otherwise one submission does open+read+close on the driver for a file
+    # up to LARGE_READ, and hands back an open handle for a larger one so the
+    # kernel fills the returned bytes in parallel chunks with no extra copy.
     data = _turbofile.try_read_file(p)
-    if data is None:
-        return await _turbofile.read_file(p)
-    return data
+    if data is not None:
+        return data
+    got = await _turbofile.read_file(p, LARGE_READ)
+    if isinstance(got, bytes):
+        return got
+    handle, _, fd = got
+    try:
+        return await read_to_eof_parallel(handle, _turbofile.FastPath(fd), 0)
+    finally:
+        await _turbofile.close(handle)
 
 
 async def write_bytes(path: Any, data: Any) -> int:

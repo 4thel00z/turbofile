@@ -320,34 +320,39 @@ impl Driver {
                 ),
                 Err(e) => cb(Err(e)),
             },
-            Op::ReadFile { path } => {
-                let opened = open_raw(
+            Op::ReadFile { path, inline_max } => {
+                let opened = open_sized(
                     &path,
                     &OpenSpec {
                         read: true,
                         ..OpenSpec::default()
                     },
                 );
-                match opened {
-                    Ok(fd) => {
-                        let hint = fd_size(fd).unwrap_or(0) as usize;
-                        self.enqueue(
-                            id,
-                            JobKind::Read(ReadJob {
-                                handle: None,
-                                fd,
-                                owned_fd: true,
-                                pos: 0,
-                                want: Want::ToEnd,
-                                buf: ReadBuf::Owned(Vec::with_capacity(hint.max(1))),
-                                filled: 0,
-                            }),
-                            None,
-                            cb,
-                        );
+                let (fd, size) = match opened {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        cb(Err(e));
+                        return;
                     }
-                    Err(e) => cb(Err(e)),
+                };
+                if size > inline_max {
+                    cb(Ok(self.register(fd, size)));
+                    return;
                 }
+                self.enqueue(
+                    id,
+                    JobKind::Read(ReadJob {
+                        handle: None,
+                        fd,
+                        owned_fd: true,
+                        pos: 0,
+                        want: Want::ToEnd,
+                        buf: ReadBuf::Owned(Vec::with_capacity((size as usize).max(1))),
+                        filled: 0,
+                    }),
+                    None,
+                    cb,
+                );
             }
             Op::WriteFile { path, data } => {
                 let opened = open_raw(
@@ -381,8 +386,12 @@ impl Driver {
     }
 
     fn open(&mut self, path: &Path, spec: &OpenSpec) -> io::Result<Reply> {
-        let fd = open_raw(path, spec)?;
-        let size = fd_size(fd)?;
+        let (fd, size) = open_sized(path, spec)?;
+        Ok(self.register(fd, size))
+    }
+
+    /// Take ownership of an open descriptor as a new handle.
+    fn register(&mut self, fd: i32, size: u64) -> Reply {
         let id = self.next_id;
         self.next_id += 1;
         self.files.insert(
@@ -393,11 +402,11 @@ impl Driver {
                 closing: None,
             },
         );
-        Ok(Reply::Handle {
+        Reply::Handle {
             id,
             size,
             fd: fd as i64,
-        })
+        }
     }
 
     fn close(&mut self, handle: u64, cb: Callback) {
@@ -715,6 +724,19 @@ fn open_raw(path: &Path, spec: &OpenSpec) -> io::Result<i32> {
     match unsafe { libc::open(cpath.as_ptr(), flags, 0o666 as libc::c_uint) } {
         -1 => Err(io::Error::last_os_error()),
         fd => Ok(fd),
+    }
+}
+
+/// Open plus the size an open handle reports; the descriptor is closed again
+/// if the size cannot be read.
+fn open_sized(path: &Path, spec: &OpenSpec) -> io::Result<(i32, u64)> {
+    let fd = open_raw(path, spec)?;
+    match fd_size(fd) {
+        Ok(size) => Ok((fd, size)),
+        Err(e) => {
+            close_raw(fd).ok();
+            Err(e)
+        }
     }
 }
 

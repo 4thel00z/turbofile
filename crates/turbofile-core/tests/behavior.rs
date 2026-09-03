@@ -196,7 +196,15 @@ fn whole_file_ops_roundtrip() {
             Reply::Written { n, .. } => assert_eq!(n, payload.len()),
             other => panic!("expected written, got {other:?}"),
         }
-        match submit_wait(&driver, Op::ReadFile { path: path.clone() }).unwrap() {
+        match submit_wait(
+            &driver,
+            Op::ReadFile {
+                path: path.clone(),
+                inline_max: u64::MAX,
+            },
+        )
+        .unwrap()
+        {
             Reply::Bytes(bytes) => assert_eq!(bytes, payload, "backend {kind:?}"),
             other => panic!("expected bytes, got {other:?}"),
         }
@@ -212,6 +220,7 @@ fn missing_file_reports_not_found() {
             &driver,
             Op::ReadFile {
                 path: dir.path().join("nope.bin"),
+                inline_max: u64::MAX,
             },
         )
         .unwrap_err();
@@ -291,5 +300,62 @@ fn zero_length_ops_complete() {
             other => panic!("expected written, got {other:?}"),
         }
         submit_wait(&driver, Op::Close { handle }).unwrap();
+    }
+}
+
+#[test]
+fn read_file_hands_off_files_above_inline_max() {
+    for kind in backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handoff.bin");
+        let payload: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &payload).unwrap();
+        let driver = Driver::new(kind).unwrap();
+
+        // At the threshold the whole read stays one submission.
+        match submit_wait(
+            &driver,
+            Op::ReadFile {
+                path: path.clone(),
+                inline_max: payload.len() as u64,
+            },
+        )
+        .unwrap()
+        {
+            Reply::Bytes(bytes) => assert_eq!(bytes, payload, "backend {kind:?}"),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+
+        // Above it the caller gets an open read handle to fill and close.
+        let (handle, size) = match submit_wait(
+            &driver,
+            Op::ReadFile {
+                path: path.clone(),
+                inline_max: payload.len() as u64 - 1,
+            },
+        )
+        .unwrap()
+        {
+            Reply::Handle { id, size, .. } => (id, size),
+            other => panic!("expected handle, got {other:?} on {kind:?}"),
+        };
+        assert_eq!(size, payload.len() as u64);
+        match submit_wait(
+            &driver,
+            Op::ReadAt {
+                handle,
+                pos: 0,
+                dest: Dest::Alloc { len: payload.len() },
+            },
+        )
+        .unwrap()
+        {
+            Reply::Bytes(bytes) => assert_eq!(bytes, payload, "backend {kind:?}"),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+        match submit_wait(&driver, Op::Close { handle }).unwrap() {
+            Reply::Unit => {}
+            other => panic!("expected unit, got {other:?}"),
+        }
     }
 }
