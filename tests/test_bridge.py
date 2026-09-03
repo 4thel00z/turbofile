@@ -1,6 +1,7 @@
 """Tests for the low-level _turbofile bridge."""
 
 import asyncio
+import os
 
 import pytest
 
@@ -174,6 +175,6 @@ async def test_read_file_hands_off_a_handle_above_inline_max(tmp_path) -> None:
 
     handle, size, fd = await _turbofile.read_file(path, len(payload) - 1)
     assert size == len(payload)
-    assert fd > 0
+    assert os.fstat(fd).st_size == size
     assert await _turbofile.read_parallel(handle, 0, size, 4096) == payload
     await _turbofile.close(handle)
