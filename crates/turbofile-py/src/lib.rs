@@ -1,7 +1,9 @@
 //! Extension module `turbofile._turbofile`: submits ops to the turbofile-core
 //! driver and completes asyncio futures through per-loop completion queues.
-//! Each burst of completions costs one `call_soon_threadsafe` (the doorbell);
-//! a drain callback on the loop thread delivers every queued completion and is
+//! Each burst of completions costs one doorbell: a byte written to a pipe the
+//! loop watches through `add_reader`, so the driver thread never takes the GIL
+//! to wake the loop (`call_soon_threadsafe` only for loops without readers). A
+//! drain callback on the loop thread delivers every queued completion and is
 //! the only place Python-owned buffers are dropped.
 
 use std::collections::HashMap;
@@ -128,10 +130,84 @@ struct LoopBridge {
     queue: Mutex<Vec<Completion>>,
     armed: AtomicBool,
     event_loop: PyObject,
-    call_soon_threadsafe: PyObject,
     /// `functools.partial(KernelFuture, loop=event_loop)`.
     create_future: PyObject,
+    /// Both set right after construction: the drain needs a weak reference to
+    /// the bridge, and the doorbell needs the drain registered with the loop.
+    doorbell: OnceLock<Doorbell>,
     drain: OnceLock<PyObject>,
+}
+
+/// How the driver thread wakes the loop thread once per completion burst.
+enum Doorbell {
+    /// The loop watches `read_fd` through `add_reader`; one byte written to
+    /// `write_fd` wakes it. A plain syscall, so the driver thread never needs
+    /// the GIL to deliver.
+    #[cfg(unix)]
+    Pipe { read_fd: i32, write_fd: i32 },
+    /// Loops without `add_reader` (a proactor): `call_soon_threadsafe(drain)`,
+    /// which takes the GIL and fails once the loop is closed.
+    CallSoon(PyObject),
+}
+
+#[cfg(unix)]
+impl Drop for Doorbell {
+    fn drop(&mut self) {
+        let Doorbell::Pipe { read_fd, write_fd } = self else {
+            return;
+        };
+        // Safety: both descriptors came from `pipe` and are closed exactly once.
+        unsafe {
+            libc::close(*read_fd);
+            libc::close(*write_fd);
+        }
+    }
+}
+
+/// A pipe with both ends non-blocking and close-on-exec.
+#[cfg(unix)]
+fn nonblocking_pipe() -> io::Result<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    // Safety: `fds` has room for the two descriptors `pipe` writes.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        // Safety: `fd` is a descriptor this function owns.
+        let flagged = unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+                && libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) == 0
+        };
+        if flagged {
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        // Safety: both descriptors are this function's and are closed exactly once.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(err);
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// The pipe doorbell for `event_loop`, or `None` when the loop has no working
+/// `add_reader` or no pipe can be made; the caller falls back to
+/// `call_soon_threadsafe`. A pipe the loop refuses is closed here.
+#[cfg(unix)]
+fn pipe_doorbell(event_loop: &Bound<'_, PyAny>, drain: &Bound<'_, PyAny>) -> Option<Doorbell> {
+    let (read_fd, write_fd) = nonblocking_pipe().ok()?;
+    let doorbell = Doorbell::Pipe { read_fd, write_fd };
+    event_loop
+        .call_method1("add_reader", (read_fd, drain))
+        .ok()?;
+    Some(doorbell)
+}
+
+#[cfg(not(unix))]
+fn pipe_doorbell(_event_loop: &Bound<'_, PyAny>, _drain: &Bound<'_, PyAny>) -> Option<Doorbell> {
+    None
 }
 
 impl LoopBridge {
@@ -145,9 +221,17 @@ impl LoopBridge {
         if !ALIVE.load(Ordering::Acquire) {
             return;
         }
+        match self.doorbell.get().expect("doorbell set at construction") {
+            #[cfg(unix)]
+            Doorbell::Pipe { write_fd, .. } => ring_pipe(*write_fd),
+            Doorbell::CallSoon(call_soon_threadsafe) => self.ring_call_soon(call_soon_threadsafe),
+        }
+    }
+
+    fn ring_call_soon(&self, call_soon_threadsafe: &PyObject) {
         Python::with_gil(|py| {
             let drain = self.drain.get().expect("drain set at construction");
-            let rung = self.call_soon_threadsafe.bind(py).call1((drain.bind(py),));
+            let rung = call_soon_threadsafe.bind(py).call1((drain.bind(py),));
             if rung.is_ok() {
                 return;
             }
@@ -158,6 +242,52 @@ impl LoopBridge {
             self.armed.store(false, Ordering::Release);
             globals().bridges.lock().unwrap().remove(&self.key);
         });
+    }
+
+    /// Loop-thread side: swallow every pending wake byte before the queue is
+    /// read, so a byte written after this read is a wake for later work.
+    fn quiet_doorbell(&self) {
+        match self.doorbell.get().expect("doorbell set at construction") {
+            #[cfg(unix)]
+            Doorbell::Pipe { read_fd, .. } => quiet_pipe(*read_fd),
+            Doorbell::CallSoon(_) => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn interrupted() -> bool {
+    io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+}
+
+/// Write the one wake byte. An `EINTR` before it is written is retried, since
+/// the bridge stays armed and nothing else would ring; `EAGAIN` means the pipe
+/// already holds a wake; any other failure means the bridge is gone.
+#[cfg(unix)]
+fn ring_pipe(write_fd: i32) {
+    loop {
+        // Safety: `write_fd` stays open for as long as its bridge lives.
+        let n = unsafe { libc::write(write_fd, [1u8].as_ptr().cast(), 1) };
+        if n >= 0 || !interrupted() {
+            return;
+        }
+    }
+}
+
+/// Read the pipe dry: stop when it is empty (`EAGAIN`) or closed, retry `EINTR`.
+#[cfg(unix)]
+fn quiet_pipe(read_fd: i32) {
+    let mut sink = [0u8; 64];
+    loop {
+        // Safety: `sink` has `sink.len()` writable bytes; the read end is non-blocking.
+        let n = unsafe { libc::read(read_fd, sink.as_mut_ptr().cast(), sink.len()) };
+        if n > 0 {
+            continue;
+        }
+        if n < 0 && interrupted() {
+            continue;
+        }
+        return;
     }
 }
 
@@ -174,6 +304,7 @@ impl DrainHandle {
         let Some(bridge) = self.bridge.upgrade() else {
             return;
         };
+        bridge.quiet_doorbell();
         loop {
             let batch: Vec<Completion> = std::mem::take(&mut *bridge.queue.lock().unwrap());
             if batch.is_empty() {
@@ -295,9 +426,9 @@ fn bridge_for_running_loop(py: Python<'_>) -> PyResult<Arc<LoopBridge>> {
         key,
         queue: Mutex::new(Vec::new()),
         armed: AtomicBool::new(false),
-        call_soon_threadsafe: event_loop.getattr("call_soon_threadsafe")?.unbind(),
         create_future,
-        event_loop: event_loop.unbind(),
+        event_loop: event_loop.clone().unbind(),
+        doorbell: OnceLock::new(),
         drain: OnceLock::new(),
     });
     let drain = Py::new(
@@ -305,11 +436,20 @@ fn bridge_for_running_loop(py: Python<'_>) -> PyResult<Arc<LoopBridge>> {
         DrainHandle {
             bridge: Arc::downgrade(&bridge),
         },
-    )?;
+    )?
+    .into_any();
+    let doorbell = match pipe_doorbell(&event_loop, drain.bind(py)) {
+        Some(doorbell) => doorbell,
+        None => Doorbell::CallSoon(event_loop.getattr("call_soon_threadsafe")?.unbind()),
+    };
     bridge
         .drain
-        .set(drain.into_any())
+        .set(drain)
         .unwrap_or_else(|_| unreachable!("drain set once"));
+    bridge
+        .doorbell
+        .set(doorbell)
+        .unwrap_or_else(|_| unreachable!("doorbell set once"));
     map.insert(key, bridge.clone());
     Ok(bridge)
 }
@@ -578,9 +718,12 @@ fn size(py: Python<'_>, handle: u64) -> PyResult<PyObject> {
     submit(py, Op::Size { handle }, Output::Plain, None)
 }
 
+/// Whole file as `bytes` in one submission when it is at most `inline_max`
+/// bytes; a larger file resolves to an open `(handle, size, fd)` instead, for
+/// the caller to fill with `read_parallel` and close.
 #[pyfunction]
-fn read_file(py: Python<'_>, path: PathBuf) -> PyResult<PyObject> {
-    submit(py, Op::ReadFile { path }, Output::Plain, None)
+fn read_file(py: Python<'_>, path: PathBuf, inline_max: u64) -> PyResult<PyObject> {
+    submit(py, Op::ReadFile { path, inline_max }, Output::Plain, None)
 }
 
 #[pyfunction]

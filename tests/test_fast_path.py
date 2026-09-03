@@ -299,3 +299,29 @@ async def test_text_mode_parity(workdir: Path) -> None:
     async with turbofile.open(p, "r", encoding="utf-8") as f:
         assert await f.read() == text.replace("\r\n", "\n")
     assert await turbofile.read_text(p) == text
+
+
+@fast_platform
+def test_fast_path_size_is_the_regular_file_size(workdir: Path) -> None:
+    """The inline size a large read-all uses instead of a driver round trip."""
+    p = workdir / "sized.bin"
+    p.write_bytes(b"s" * 12345)
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        fast = _turbofile.FastPath(fd)
+        assert fast.size() == 12345
+        with open(p, "ab") as w:
+            w.write(b"grown")
+        assert fast.size() == 12350
+    finally:
+        os.close(fd)
+
+
+@fast_platform
+def test_fast_path_size_declines_non_regular_files() -> None:
+    read_end, write_end = os.pipe()
+    try:
+        assert _turbofile.FastPath(read_end).size() is None
+    finally:
+        os.close(read_end)
+        os.close(write_end)

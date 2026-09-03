@@ -14,12 +14,43 @@ CHUNK = 65536
 
 # Above this expected size, read-all switches from the single-op read_to_end
 # (one extra buffer copy) to a size-guided read that the kernel writes straight
-# into the returned bytes object, plus a probe for post-snapshot growth.
+# into the returned bytes object, with a read to true EOF only when the file
+# grew past the snapshot.
 LARGE_READ = 1024 * 1024
 
 # Chunk size for the parallel fill of one large read; parallel chunks spread
-# the page-cache copy across kernel service threads.
-PARALLEL_CHUNK = 2 * 1024 * 1024
+# the page-cache copy across kernel service threads. 512 KiB keeps at least
+# sixteen chunks in flight from 8 MiB up, which is where the copy throughput
+# peaks on Darwin's four AIO threads; smaller chunks lose to per-op cost.
+PARALLEL_CHUNK = 512 * 1024
+
+
+async def read_to_eof_parallel(handle: int, fast: Any, start: int) -> bytes:
+    """Everything from `start` to EOF, filled by parallel chunks the kernel
+    writes straight into the returned bytes.
+
+    The size snapshot and the end-of-file check are inline `fstat` calls when
+    `fast` (a `FastPath`) can make them; a file it cannot describe pays one
+    driver round trip for the size and a read to true EOF after the fill.
+    """
+    size_now = fast.size() if fast else None
+    if size_now is None:
+        size_now = await _turbofile.size(handle)
+    remaining = max(size_now - start, 0)
+    first = await _turbofile.read_parallel(handle, start, remaining, PARALLEL_CHUNK)
+    if len(first) < remaining:
+        return first
+    if fast and fast.size() == size_now:
+        return first
+    # The file may have grown past the size snapshot; read to true EOF.
+    parts = [first]
+    offset = start + len(first)
+    while True:
+        probe = await _turbofile.read_to_end(handle, offset)
+        if not probe:
+            return b"".join(parts)
+        parts.append(probe)
+        offset += len(probe)
 
 
 class BinaryFile:
@@ -117,27 +148,12 @@ class BinaryFile:
         return data
 
     async def read_all_large(self, start: int) -> bytes:
-        size_now = await _turbofile.size(self.handle)
-        remaining = max(size_now - start, 0)
-        first = await _turbofile.read_parallel(
-            self.handle, start, remaining, PARALLEL_CHUNK
-        )
-        parts = [self.pending, first] if self.pending else [first]
-        offset = start + len(first)
-        if len(first) == remaining:
-            # The file may have grown past the size snapshot; read to true EOF.
-            while True:
-                probe = await _turbofile.read_to_end(self.handle, offset)
-                if not probe:
-                    break
-                parts.append(probe)
-                offset += len(probe)
+        rest = await read_to_eof_parallel(self.handle, self.fast, start)
+        data = self.pending + rest if self.pending else rest
         self.pending = b""
-        self.pos = offset
-        self.size_hint = max(self.size_hint, offset)
-        if len(parts) == 1:
-            return parts[0]
-        return b"".join(parts)
+        self.pos = start + len(rest)
+        self.size_hint = max(self.size_hint, self.pos)
+        return data
 
     async def read1(self, size: int = -1, /) -> bytes:
         self.check_open()
