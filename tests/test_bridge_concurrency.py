@@ -60,22 +60,27 @@ async def test_queued_ops_cancel_deterministically(tmp_path) -> None:
     if _turbofile.backend_name() != "darwin-aio":
         pytest.skip("the queued-cancel floor needs the darwin aio queue")
     path = str(tmp_path / "flood.bin")
-    payload = b"q" * 65536
+    payload = b"q" * (8 * 1024 * 1024)
     await _turbofile.write_file(path, payload)
     handle, _, _ = await _turbofile.open(
         path, True, False, False, False, False, False
     )
 
-    # kern.aioprocmax caps in-flight aiocbs (16 by default), so the tail of
-    # this burst is still in the userspace queue when the cancels arrive.
-    futures = [_turbofile.read(handle, 0, 65536) for _ in range(64)]
-    for fut in futures[32:]:
+    # kern.aioprocmax caps in-flight aiocbs (16 by default). Sixteen whole-file
+    # reads hold every slot for a millisecond or more of kernel copying, so a
+    # small read submitted and cancelled right behind them is still in the
+    # userspace queue when its cancel arrives.
+    head = [_turbofile.read(handle, 0, len(payload)) for _ in range(16)]
+    tail = []
+    for _ in range(32):
+        fut = _turbofile.read(handle, 0, 4)
         fut.cancel()
-    results = await asyncio.gather(*futures, return_exceptions=True)
-    for result in results[:32]:
+        tail.append(fut)
+    results = await asyncio.gather(*head, *tail, return_exceptions=True)
+    for result in results[:16]:
         assert result == payload
-    cancelled = [r for r in results[32:] if isinstance(r, asyncio.CancelledError)]
-    completed = [r for r in results[32:] if not isinstance(r, BaseException)]
+    cancelled = [r for r in results[16:] if isinstance(r, asyncio.CancelledError)]
+    completed = [r for r in results[16:] if r == b"qqqq"]
     assert len(cancelled) + len(completed) == 32
     assert cancelled
 

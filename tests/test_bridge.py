@@ -82,6 +82,56 @@ async def test_readinto_fills_caller_buffer(tmp_path) -> None:
     await _turbofile.close(handle)
 
 
+class LoopWithoutThreadsafeCalls(asyncio.SelectorEventLoop):
+    """A real selector loop whose call_soon_threadsafe is unusable.
+
+    Completions must still arrive: the doorbell may not depend on it, since
+    that path needs the GIL on the driver thread.
+    """
+
+    def call_soon_threadsafe(self, callback, *args, context=None):  # type: ignore[override]
+        raise AssertionError("doorbell used call_soon_threadsafe")
+
+
+def run_roundtrip_on(loop: asyncio.AbstractEventLoop, path: str) -> bytes:
+    """write_file then read_file on `loop`, failing (not hanging) if a completion is lost.
+
+    A lost completion leaves its future unsettled forever, so the inner task is
+    shielded and the loop is closed without cancelling it.
+    """
+
+    async def roundtrip() -> bytes:
+        await _turbofile.write_file(path, b"rung through the doorbell")
+        return await _turbofile.read_file(path)
+
+    async def guarded() -> bytes:
+        return await asyncio.wait_for(asyncio.shield(roundtrip()), 5)
+
+    try:
+        return loop.run_until_complete(guarded())
+    finally:
+        loop.close()
+
+
+def test_completions_arrive_without_call_soon_threadsafe(tmp_path) -> None:
+    path = str(tmp_path / "doorbell.bin")
+    data = run_roundtrip_on(LoopWithoutThreadsafeCalls(), path)
+    assert data == b"rung through the doorbell"
+
+
+class LoopWithoutReaders(asyncio.SelectorEventLoop):
+    """A loop that refuses `add_reader`, as a proactor loop does."""
+
+    def add_reader(self, fd, callback, *args):  # type: ignore[override]
+        raise NotImplementedError
+
+
+def test_loop_without_add_reader_completes_through_call_soon_threadsafe(tmp_path) -> None:
+    path = str(tmp_path / "fallback.bin")
+    data = run_roundtrip_on(LoopWithoutReaders(), path)
+    assert data == b"rung through the doorbell"
+
+
 def test_backend_name_reports_the_live_driver() -> None:
     import os
     import sys
