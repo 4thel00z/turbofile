@@ -99,7 +99,7 @@ async fn run(rx: flume::Receiver<Msg>) {
             Msg::Submit { id, op, cb } => (id, op, cb),
         };
         let open_id = match &op {
-            Op::Open { .. } => {
+            Op::Open { .. } | Op::ReadFile { .. } => {
                 next_id += 1;
                 Some(next_id - 1)
             }
@@ -205,10 +205,18 @@ async fn execute(
             let file = lookup(&files, handle)?;
             Ok(Reply::Size(file.metadata().await?.len()))
         }
-        Op::ReadFile { path } => {
+        Op::ReadFile { path, inline_max } => {
             let file = OpenOptions::new().read(true).open(&path).await?;
-            let size = file.metadata().await?.len() as usize;
-            let BufResult(res, buf) = file.read_to_end_at(Vec::with_capacity(size + 1), 0).await;
+            let size = file.metadata().await?.len();
+            if size > inline_max {
+                let fd = file.as_raw_fd() as i64;
+                let id = open_id.expect("read_file allocates an id");
+                files.borrow_mut().insert(id, file);
+                return Ok(Reply::Handle { id, size, fd });
+            }
+            let BufResult(res, buf) = file
+                .read_to_end_at(Vec::with_capacity(size as usize + 1), 0)
+                .await;
             res?;
             file.close().await?;
             Ok(Reply::Bytes(buf))

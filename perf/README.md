@@ -168,3 +168,13 @@ pages matter too: a single 8 MiB `aio_read` into a never-touched buffer costs
 the kernel thread takes. The public read-all also paid two driver round trips
 for its size snapshot and its end-of-file check; both are now an inline
 `fstat`, the same call the fast path already makes.
+
+`read_bytes` was the one large read still on a single `aio_read`: one
+submission did open, a read-to-end into a `Vec`, and close, and the `Vec` was
+then copied into `bytes` on delivery, 1.24 ms for 8 MiB against 0.98 ms for
+an executor read of the same file. The op now hands back an open handle when
+the file is above 1 MiB and the caller runs the same parallel fill into the
+returned `bytes`, then closes: three round trips instead of one, but no copy
+and sixteen chunks in flight. 8 MiB 1.24 → 0.46 ms; 64 MiB 2.67 ms against
+8.5 ms for the executor read. Files at or under 1 MiB keep the single
+submission.

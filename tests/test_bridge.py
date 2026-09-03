@@ -65,7 +65,7 @@ async def test_read_file_and_write_file(tmp_path) -> None:
     payload = b"\x00\x01turbo\xfffile"
     n, end = await _turbofile.write_file(path, payload)
     assert (n, end) == (len(payload), len(payload))
-    assert await _turbofile.read_file(path) == payload
+    assert await _turbofile.read_file(path, 1 << 40) == payload
 
 
 @pytest.mark.asyncio
@@ -102,7 +102,7 @@ def run_roundtrip_on(loop: asyncio.AbstractEventLoop, path: str) -> bytes:
 
     async def roundtrip() -> bytes:
         await _turbofile.write_file(path, b"rung through the doorbell")
-        return await _turbofile.read_file(path)
+        return await _turbofile.read_file(path, 1 << 40)
 
     async def guarded() -> bytes:
         return await asyncio.wait_for(asyncio.shield(roundtrip()), 5)
@@ -161,4 +161,19 @@ async def test_read_parallel_fills_one_buffer(tmp_path) -> None:
     assert data == payload
     tail = await _turbofile.read_parallel(handle, len(payload) - 100, 1000, 256)
     assert tail == payload[-100:]
+    await _turbofile.close(handle)
+
+
+@pytest.mark.asyncio
+async def test_read_file_hands_off_a_handle_above_inline_max(tmp_path) -> None:
+    path = str(tmp_path / "handoff.bin")
+    payload = bytes(range(256)) * 64
+    await _turbofile.write_file(path, payload)
+
+    assert await _turbofile.read_file(path, len(payload)) == payload
+
+    handle, size, fd = await _turbofile.read_file(path, len(payload) - 1)
+    assert size == len(payload)
+    assert fd > 0
+    assert await _turbofile.read_parallel(handle, 0, size, 4096) == payload
     await _turbofile.close(handle)

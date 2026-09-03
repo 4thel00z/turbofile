@@ -25,6 +25,34 @@ LARGE_READ = 1024 * 1024
 PARALLEL_CHUNK = 512 * 1024
 
 
+async def read_to_eof_parallel(handle: int, fast: Any, start: int) -> bytes:
+    """Everything from `start` to EOF, filled by parallel chunks the kernel
+    writes straight into the returned bytes.
+
+    The size snapshot and the end-of-file check are inline `fstat` calls when
+    `fast` (a `FastPath`) can make them; a file it cannot describe pays one
+    driver round trip for the size and a read to true EOF after the fill.
+    """
+    size_now = fast.size() if fast else None
+    if size_now is None:
+        size_now = await _turbofile.size(handle)
+    remaining = max(size_now - start, 0)
+    first = await _turbofile.read_parallel(handle, start, remaining, PARALLEL_CHUNK)
+    if len(first) < remaining:
+        return first
+    if fast and fast.size() == size_now:
+        return first
+    # The file may have grown past the size snapshot; read to true EOF.
+    parts = [first]
+    offset = start + len(first)
+    while True:
+        probe = await _turbofile.read_to_end(handle, offset)
+        if not probe:
+            return b"".join(parts)
+        parts.append(probe)
+        offset += len(probe)
+
+
 class BinaryFile:
     def __init__(self, handle: int, fd: int, size: int, name: Any, info: ModeInfo) -> None:
         self.handle = handle
@@ -120,40 +148,12 @@ class BinaryFile:
         return data
 
     async def read_all_large(self, start: int) -> bytes:
-        size_now = await self.current_size()
-        remaining = max(size_now - start, 0)
-        first = await _turbofile.read_parallel(
-            self.handle, start, remaining, PARALLEL_CHUNK
-        )
-        parts = [self.pending, first] if self.pending else [first]
-        offset = start + len(first)
-        if len(first) == remaining and not self.still_ends_at(size_now):
-            # The file may have grown past the size snapshot; read to true EOF.
-            while True:
-                probe = await _turbofile.read_to_end(self.handle, offset)
-                if not probe:
-                    break
-                parts.append(probe)
-                offset += len(probe)
+        rest = await read_to_eof_parallel(self.handle, self.fast, start)
+        data = self.pending + rest if self.pending else rest
         self.pending = b""
-        self.pos = offset
-        self.size_hint = max(self.size_hint, offset)
-        if len(parts) == 1:
-            return parts[0]
-        return b"".join(parts)
-
-    async def current_size(self) -> int:
-        """The file's size now: an inline `fstat` through the fast path, or one
-        driver round trip for a file the fast path cannot describe."""
-        size = self.fast.size() if self.fast else None
-        if size is None:
-            return await _turbofile.size(self.handle)
-        return size
-
-    def still_ends_at(self, size: int) -> bool:
-        """Whether an inline `fstat` shows the file still ending at `size`;
-        False when the fast path cannot tell, so the caller reads to true EOF."""
-        return bool(self.fast) and self.fast.size() == size
+        self.pos = start + len(rest)
+        self.size_hint = max(self.size_hint, self.pos)
+        return data
 
     async def read1(self, size: int = -1, /) -> bytes:
         self.check_open()

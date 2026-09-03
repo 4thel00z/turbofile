@@ -52,3 +52,11 @@ async def test_read_all_after_another_writer_truncated(tmp_path) -> None:
         # Shrink after the open-time size snapshot, but keep it a large read.
         os.truncate(path, 2 * binary.LARGE_READ)
         assert await f.read() == payload[: 2 * binary.LARGE_READ]
+
+
+@pytest.mark.asyncio
+async def test_read_bytes_large_file_roundtrip(tmp_path) -> None:
+    path = tmp_path / "whole-large.bin"
+    payload = bytes(range(256)) * (2 * 4096) + b"odd tail"  # 2 MiB + 8
+    path.write_bytes(payload)
+    assert await turbofile.read_bytes(path) == payload

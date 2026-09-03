@@ -718,9 +718,12 @@ fn size(py: Python<'_>, handle: u64) -> PyResult<PyObject> {
     submit(py, Op::Size { handle }, Output::Plain, None)
 }
 
+/// Whole file as `bytes` in one submission when it is at most `inline_max`
+/// bytes; a larger file resolves to an open `(handle, size, fd)` instead, for
+/// the caller to fill with `read_parallel` and close.
 #[pyfunction]
-fn read_file(py: Python<'_>, path: PathBuf) -> PyResult<PyObject> {
-    submit(py, Op::ReadFile { path }, Output::Plain, None)
+fn read_file(py: Python<'_>, path: PathBuf, inline_max: u64) -> PyResult<PyObject> {
+    submit(py, Op::ReadFile { path, inline_max }, Output::Plain, None)
 }
 
 #[pyfunction]

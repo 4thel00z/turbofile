@@ -126,8 +126,13 @@ pub enum Op {
     Size {
         handle: u64,
     },
+    /// Open, read and close in one submission when the file is at most
+    /// `inline_max` bytes. A larger file comes back as an open read handle
+    /// (`Reply::Handle`) instead, so the caller can fill its own buffer with a
+    /// parallel read and close it: one copy less, and chunks in flight.
     ReadFile {
         path: PathBuf,
+        inline_max: u64,
     },
     WriteFile {
         path: PathBuf,
