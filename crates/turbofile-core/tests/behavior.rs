@@ -359,3 +359,49 @@ fn read_file_hands_off_files_above_inline_max() {
         }
     }
 }
+
+/// A read to end whose first chunk reaches the size the file reported ends
+/// there: one kernel round trip, and a buffer of exactly that size. Before,
+/// the driver grew the buffer and read again just to see the zero.
+#[cfg(target_os = "macos")]
+#[test]
+fn read_to_end_stops_at_the_reported_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("exact.bin");
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&path, &payload).unwrap();
+    let driver = Driver::new(BackendKind::DarwinAio).unwrap();
+
+    match submit_wait(
+        &driver,
+        Op::ReadFile {
+            path: path.clone(),
+            inline_max: u64::MAX,
+        },
+    )
+    .unwrap()
+    {
+        Reply::Bytes(bytes) => {
+            assert_eq!(bytes, payload);
+            assert_eq!(bytes.capacity(), payload.len());
+        }
+        other => panic!("expected bytes, got {other:?}"),
+    }
+
+    let handle = open_handle(
+        &driver,
+        &path,
+        OpenSpec {
+            read: true,
+            ..OpenSpec::default()
+        },
+    );
+    match submit_wait(&driver, Op::ReadToEnd { handle, pos: 1000 }).unwrap() {
+        Reply::Bytes(bytes) => {
+            assert_eq!(bytes, payload[1000..]);
+            assert_eq!(bytes.capacity(), payload.len() - 1000);
+        }
+        other => panic!("expected bytes, got {other:?}"),
+    }
+    submit_wait(&driver, Op::Close { handle }).unwrap();
+}
