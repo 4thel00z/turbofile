@@ -178,3 +178,52 @@ returned `bytes`, then closes: three round trips instead of one, but no copy
 and sixteen chunks in flight. 8 MiB 1.24 → 0.46 ms; 64 MiB 2.67 ms against
 8.5 ms for the executor read. Files at or under 1 MiB keep the single
 submission.
+
+### One round trip per read-to-end
+
+Every read to end on the darwin driver cost two AIO round trips. The first
+`aio_read` filled the buffer to the size `fstat` had reported; the chunk step
+then saw a non-zero count on a read-to-end, grew the buffer (a realloc and a
+copy of everything read so far) and submitted a second `aio_read` whose only
+purpose was to return zero. That is the whole of `read_bytes` for files up to
+1 MiB and of every cold `read()` that the fast path declined. The step now
+asks `fstat` after each chunk and ends the op when a regular file's size is at
+or below what has been read; anything that is not a regular file keeps reading
+until the zero, since its `st_size` means nothing.
+
+Result per hot 4 KiB file, same session, load average 4 to 6:
+
+| rung | before | after |
+| ---- | ------ | ----- |
+| `read_bytes` min | 55,453 ns | 45,396 ns |
+| `read_bytes` p50 | 56,184 ns | 46,255 ns |
+| `read` (sized, one chunk already) | 33,441 ns | 33,052 ns |
+
+The bench's 200-file storm went from 5.0x to 5.4x aiofiles for the same reason
+(5.9x to 6.1x when that workload runs alone).
+
+### Resident reads on the driver thread, measured and dropped
+
+The remaining hop per `read_bytes` is the kernel AIO thread: `aio_read`, the
+copy on that thread, and the `aio_suspend` wake. `mincore` on a one-shot
+`PROT_NONE` mapping can tell the driver the pages are resident, in which case a
+plain `pread` on the driver thread would do. Three interleaved rounds through
+the public `read_bytes`, min / p50 in µs per call, plus the bench's 200-file
+storm:
+
+| variant | 4 KiB | 64 KiB | 128 KiB | storm p50 |
+| ------- | ----- | ------ | ------- | --------- |
+| `aio_read` (shipped) | 40.3 / 46.0 | 45.2 / 49.3 | 46.9 / 51.6 | 2.94 ms |
+| `mincore` then `pread` | 39.7 / 43.8 | 42.8 / 47.7 | 47.7 / 51.2 | 3.66 ms |
+| `pread` when the driver is idle, no check | 36.0 / 40.5 | 37.7 / 44.5 | 41.9 / 47.2 | 3.00 ms |
+
+`mmap`, `mincore` and `munmap` cost 3 to 4 µs for one page and grow with the
+page count, which is within a microsecond of the hop they replace; on the
+storm the check runs 200 times on the one driver thread while the copies it
+replaced ran on four kernel threads, hence the 25% loss. Skipping the check
+when nothing else is pending at the driver does save 5 µs on a lone hot read,
+but a lone cold read then blocks the driver for a disk read, and staggered
+concurrent cold reads (a semaphore-bounded crawl over a cold directory) would
+serialize on one thread instead of four. Neither variant shipped. The probe
+scripts stayed out of the repo; the numbers are here so the experiment is not
+repeated.
