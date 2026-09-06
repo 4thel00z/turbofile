@@ -8,7 +8,10 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::{bad_handle, cancelled_error, Callback, Dest, Msg, Op, OpenSpec, Payload, Reply};
+use crate::{
+    bad_handle, cancelled_error, regular_file_size, Callback, Dest, Msg, Op, OpenSpec, Payload,
+    Reply,
+};
 
 /// Upper bound for the `aio_suspend` wait while ops are in flight; newly
 /// submitted ops wait at most this long before the driver notices them.
@@ -60,6 +63,21 @@ struct ReadJob {
     want: Want,
     buf: ReadBuf,
     filled: usize,
+}
+
+impl ReadJob {
+    /// Whether the bytes read so far are all the op asked for: the requested
+    /// count for a sized read, the file's current end for a read to end. Only
+    /// a regular file's size is trusted; anything else reads on until a
+    /// zero-length result.
+    fn complete(&self) -> bool {
+        match self.want {
+            Want::Exact(len) => self.filled >= len,
+            Want::ToEnd => {
+                regular_file_size(self.fd).is_some_and(|size| self.pos + self.filled as u64 >= size)
+            }
+        }
+    }
 }
 
 struct WriteJob {
@@ -632,15 +650,10 @@ fn step(job: &mut Job, n: usize) -> Step {
     match &mut job.kind {
         JobKind::Read(read) => {
             read.filled += n;
-            let done = match (&read.want, n) {
-                (_, 0) => true,
-                (Want::Exact(len), _) => read.filled >= *len,
-                (Want::ToEnd, _) => false,
-            };
-            if done {
+            if n == 0 || read.complete() {
                 return Step::Done(read_reply(read));
             }
-            if let (Want::ToEnd, ReadBuf::Owned(vec)) = (&read.want, &mut read.buf) {
+            if let ReadBuf::Owned(vec) = &mut read.buf {
                 if read.filled == vec.capacity() {
                     vec.reserve(vec.capacity().max(65536));
                 }
