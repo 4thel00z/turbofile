@@ -159,14 +159,16 @@ impl Driver {
                     Err(_) => return,
                 }
             }
-            self.progress = false;
             if !self.inflight.is_empty() {
                 self.suspend();
                 self.reap();
             }
             self.drain_channel();
             self.submit_ready();
-            self.suspend_ns = match self.progress {
+            // Progress covers everything since the last wait was chosen: a
+            // message taken while idle above, and the completions and messages
+            // of this pass.
+            self.suspend_ns = match std::mem::take(&mut self.progress) {
                 true => SUSPEND_MIN_NS,
                 false => (self.suspend_ns * 2).min(SUSPEND_MAX_NS),
             };
