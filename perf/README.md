@@ -272,3 +272,80 @@ op, 37 / 72 to 79 beside writes, idle 34 / 44, and the CPU over a 256 MiB read
 within 0.6 ms of its wall time. The ladder's `bridge`, `read` and `read_bytes`
 rungs and the 200-file storm are unchanged, since a completion ends the wait
 before either timeout matters there.
+
+### Opens off the driver thread
+
+With one round trip per file the 200-file storm still took 2.8 ms, and a
+split of that time put the driver thread on the critical path. Two hundred
+serial `open` and `close` calls cost 1.9 ms on this machine, about 8 µs per
+`open` with Jamf Protect's Endpoint Security extension authorizing each one
+and 2 µs per `close`, while the event loop's 200 coroutines, submissions and
+resumptions cost 0.9 ms and ran alongside. `openat` on a directory
+descriptor, `O_NONBLOCK` and `O_CLOEXEC` change nothing, and a `stat` of the
+same path is 1 µs, so the cost is the open itself, not the lookup. Spread over
+threads it does scale: 200 opens took 1.05 ms on four Python threads against
+1.95 ms on one, GIL included.
+
+| part of the storm | ms |
+| ----------------- | -- |
+| 200 gathered coroutines, no I/O | 0.38 |
+| 200 gathered `probe_nop` (the bridge alone) | 0.89 |
+| 200 serial `open` + `close`, one thread | 1.95 |
+| 200 serial `open` + `pread` + `close`, one thread | 2.33 |
+| 200 gathered `read_bytes` | 2.96 |
+
+Two ways to run opens on more threads were weighed. Several driver threads,
+each with its own `aio_suspend` loop, would spread the opens with no extra
+hop, but XNU sleeps every `aio_suspend` caller on one per-process channel and
+wakes all of them on each completion (`wakeup`, not `wakeup_one`, in
+`kern_aio.c`), so N loops pay N−1 spurious kernel wakes and a rescan under
+the process's AIO lock per completion, exactly during a burst. They would
+also have to share the 16-slot `kern.aioprocmax` cap, and the fallback that
+runs an op synchronously when a submission returns EAGAIN with nothing in
+flight would then put blocking I/O on a driver thread whenever another driver
+held the slots. So the driver keeps its single loop, and a small pool of
+helper threads runs only the `open` (and the `close` of a descriptor the
+driver owns), only while the driver has a backlog: submissions waiting in its
+channel, jobs waiting for an AIO slot, or opens already out at the helpers. A
+lone op opens on the driver thread as before and pays no extra hop. The
+descriptors come back as messages the driver takes in the same pass as its
+completions, and every callback still runs on the driver thread; a helper
+settles an op itself only when the driver has already gone away at shutdown.
+A cancel for an op whose open is out at a helper is remembered and wins when
+the open comes back. An open that never returns, on a path that hangs, keeps
+one helper and the backlog flag for the driver's lifetime, so later opens all
+take the helper hop; before, the driver itself was stuck.
+
+The helper count, storm p50 in ms over three interleaved rounds (one helper
+is the pipelined case: the driver submits, reaps and closes while the helper
+opens):
+
+| helpers | 1 | 2 | 3 | 4 | 5 | 6 |
+| ------- | ---- | ---- | ---- | ---- | ---- | ---- |
+| storm p50 | 2.60 | 1.67 | 1.39 | 1.51 | 1.84 | 2.10 |
+
+Three won on this 6P+6E machine and six lost to two, since the driver, the
+event loop and the four kernel AIO threads want cores as well. The count is
+one helper per four hardware threads, at least two and at most four.
+
+Result, the previous build against this one as wheels in two venvs, three
+interleaved rounds each:
+
+| build | storm min | storm p50 | process CPU per storm |
+| ----- | --------- | --------- | --------------------- |
+| one driver thread (before) | 2.72 ms | 2.87 ms | 5.0 to 5.1 ms |
+| helper opens (this change) | 1.31 ms | 1.40 ms | 6.8 ms |
+
+The CPU that the storm costs the process goes up by a third while its wall
+time halves: the same 200 opens and closes run on three threads instead of
+one, and the kernel's open path contends where it used to run alone. A helper
+that polled its queue for 20 µs before blocking, to save the sleep and wake
+between jobs, took the CPU from 6.8 to 6.6 ms and the wall time nowhere, so
+the helpers block at once.
+
+In the full bench the storm went from 5.4x to 12.6x aiofiles (6.0x to 13.5x
+when that workload runs alone). The ladder's `read_bytes` (41.4 µs min) and
+`bridge` (24.3 µs) rungs are within the session's variation of the previous
+build, and a read beside a slow op still takes 29 to 32 µs p50 and 158 to
+188 µs p99. Of the 1.4 ms that remain, 0.9 ms is the event loop's 200
+coroutines and the bridge.
