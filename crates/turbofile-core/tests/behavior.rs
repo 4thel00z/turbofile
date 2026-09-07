@@ -405,3 +405,64 @@ fn read_to_end_stops_at_the_reported_size() {
     }
     submit_wait(&driver, Op::Close { handle }).unwrap();
 }
+
+/// A read submitted while one slow op holds `aio_suspend` is noticed within
+/// the wait's cap, not a fixed millisecond. Each small read follows a 1 ms
+/// lull, so the wait has backed off as far as it goes; at least one of three
+/// must still settle well under a millisecond.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_read_beside_a_slow_op_is_noticed_within_the_wait_cap() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.bin");
+    let big_len = 128 << 20;
+    std::fs::write(&big, vec![3u8; big_len]).unwrap();
+    let small = dir.path().join("small.bin");
+    std::fs::write(&small, vec![5u8; 4096]).unwrap();
+    let driver = Driver::new(BackendKind::DarwinAio).unwrap();
+    let handle = open_handle(
+        &driver,
+        &big,
+        OpenSpec {
+            read: true,
+            ..OpenSpec::default()
+        },
+    );
+    let small_read = || Op::ReadFile {
+        path: small.clone(),
+        inline_max: u64::MAX,
+    };
+    submit_wait(&driver, small_read()).unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    driver.submit(
+        Op::ReadAt {
+            handle,
+            pos: 0,
+            dest: Dest::Alloc { len: big_len },
+        },
+        Box::new(move |result| tx.send(result).unwrap()),
+    );
+    let mut latencies = Vec::new();
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(1));
+        let started = Instant::now();
+        match submit_wait(&driver, small_read()).unwrap() {
+            Reply::Bytes(bytes) => assert_eq!(bytes.len(), 4096),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+        latencies.push(started.elapsed());
+    }
+    match rx.recv().unwrap().unwrap() {
+        Reply::Bytes(bytes) => assert_eq!(bytes.len(), big_len),
+        other => panic!("expected bytes, got {other:?}"),
+    }
+    let best = latencies.iter().min().unwrap();
+    assert!(
+        *best < Duration::from_micros(800),
+        "small reads beside the slow op took {latencies:?}"
+    );
+    submit_wait(&driver, Op::Close { handle }).unwrap();
+}

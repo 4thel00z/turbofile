@@ -1,6 +1,8 @@
 //! POSIX AIO backend for macOS. One driver thread submits aio ops and reaps
 //! completions with a timed `aio_suspend` loop; XNU has no kqueue completion
-//! delivery, so the timeout doubles as the new-submission latency bound.
+//! delivery, so the timeout doubles as the new-submission latency bound. The
+//! timeout adapts: short after a pass that reaped a completion or handled a
+//! message, doubling toward a cap while nothing moves.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
@@ -13,9 +15,15 @@ use crate::{
     Reply,
 };
 
-/// Upper bound for the `aio_suspend` wait while ops are in flight; newly
-/// submitted ops wait at most this long before the driver notices them.
-const SUSPEND_TIMEOUT_NS: i64 = 1_000_000;
+/// The `aio_suspend` wait right after a pass that made progress. A submission
+/// arriving while ops are in flight waits at most this long to be noticed, as
+/// long as traffic keeps flowing.
+const SUSPEND_MIN_NS: i64 = 20_000;
+
+/// Cap on the wait once passes stop making progress: the driver doubles from
+/// the minimum up to here, so a lull costs at most this much notice latency
+/// while a wake every cap-length period keeps the polling cost near zero.
+const SUSPEND_MAX_NS: i64 = 160_000;
 
 /// XNU rejects submissions beyond kern.aioprocmax with EAGAIN; staying under
 /// it keeps the pending queue in userspace where it is observable.
@@ -121,6 +129,8 @@ struct Driver {
     queue: VecDeque<Job>,
     max_inflight: usize,
     disconnected: bool,
+    suspend_ns: i64,
+    progress: bool,
 }
 
 impl Driver {
@@ -133,6 +143,8 @@ impl Driver {
             queue: VecDeque::new(),
             max_inflight: aio_proc_max(),
             disconnected: false,
+            suspend_ns: SUSPEND_MIN_NS,
+            progress: false,
         }
     }
 
@@ -153,6 +165,13 @@ impl Driver {
             }
             self.drain_channel();
             self.submit_ready();
+            // Progress covers everything since the last wait was chosen: a
+            // message taken while idle above, and the completions and messages
+            // of this pass.
+            self.suspend_ns = match std::mem::take(&mut self.progress) {
+                true => SUSPEND_MIN_NS,
+                false => (self.suspend_ns * 2).min(SUSPEND_MAX_NS),
+            };
         }
     }
 
@@ -164,7 +183,7 @@ impl Driver {
             .collect();
         let timeout = libc::timespec {
             tv_sec: 0,
-            tv_nsec: SUSPEND_TIMEOUT_NS,
+            tv_nsec: self.suspend_ns,
         };
         unsafe {
             libc::aio_suspend(list.as_ptr(), list.len() as libc::c_int, &timeout);
@@ -180,6 +199,7 @@ impl Driver {
                 continue;
             }
             let mut entry = self.inflight.swap_remove(index);
+            self.progress = true;
             let n = unsafe { libc::aio_return(&mut *entry.aiocb) };
             match err {
                 0 => self.advance(entry.job, n as usize),
@@ -202,6 +222,7 @@ impl Driver {
     }
 
     fn handle_msg(&mut self, msg: Msg) {
+        self.progress = true;
         match msg {
             Msg::Submit { id, op, cb } => self.handle_op(id, op, cb),
             Msg::Cancel { id } => self.cancel(id),

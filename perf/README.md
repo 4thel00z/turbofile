@@ -227,3 +227,48 @@ concurrent cold reads (a semaphore-bounded crawl over a cold directory) would
 serialize on one thread instead of four. Neither variant shipped. The probe
 scripts stayed out of the repo; the numbers are here so the experiment is not
 repeated.
+
+### The notice cliff
+
+The darwin driver has two ways to sleep. With nothing in flight it blocks on
+the submission channel and a new op wakes it at once. With ops in flight it
+blocks in `aio_suspend`, which only a completion or its timeout can end; XNU
+delivers no AIO completions through `kqueue`, and `aio_suspend` watches no file
+descriptor, so the channel cannot reach it. An op submitted while the only
+things in flight are slow therefore waited for the fixed 1 ms timeout.
+
+Measured with a hot 4 KiB read through the driver path (`_turbofile.read` on
+an open handle, 35 µs idle), first beside a single 256 MiB `aio_read` that
+holds the driver for about 35 ms, then beside a coroutine writing 1 MiB
+chunks; p50 / p99 in µs, two interleaved rounds per row. The last column is
+the process CPU added over one 256 MiB read with no other traffic, which is
+the polling cost while a slow op is in flight and nothing completes.
+
+| wait | lone slow op | beside writes | polling cost |
+| ---- | ------------ | ------------- | ------------ |
+| fixed 1 ms (before) | 1,136 / 1,200 | 103 / 170 to 750 | none |
+| fixed 200 µs | 235 / 250 | 103 / 240 | none |
+| fixed 50 µs | 65 / 86 to 307 | 63 / 105 | +2.5 to 3 ms of 35 (7 to 8% of a core) |
+| fixed 20 µs | 33 / 70 to 86 | 35 / 69 | +1.7 to 6 ms (5 to 17%) |
+| adaptive 20 µs, doubling to 1 ms | 33 / 350 to 520 | 35 / 80 | +0.3 to 1.8 ms |
+| adaptive 20 µs, doubling to 320 µs | 35 / 365 | 35 / 76 | none measurable |
+| adaptive 20 µs, doubling to 160 µs | 33 / 190 | 36 / 72 | none measurable |
+
+The adaptive wait starts at 20 µs after any pass that reaped a completion or
+handled a message and doubles while nothing moves, so traffic keeps it short
+and a lull costs at most the cap. The 160 µs cap shipped: same p50 as the
+fixed 20 µs wait everywhere, the same p99 beside writes, a longer tail only
+for the first op after a lull, and no polling bill. The fixed 20 µs wait buys
+that tail for 5 to 17% of a core whenever slow ops are in flight. A
+`pthread_kill` from the submitter to a no-op handler on the driver thread
+would end `aio_suspend` on the submission itself and remove the cliff
+entirely; it needs an `EINTR` retry around every blocking syscall the driver
+makes and a timeout kept as backstop for the window between the flag check
+and entering `aio_suspend`. It was not prototyped and the adaptive wait keeps
+a timeout anyway, so it can replace the timer later if the tail matters.
+
+The shipped build, measured the same way: 35 / 130 to 180 beside the lone slow
+op, 37 / 72 to 79 beside writes, idle 34 / 44, and the CPU over a 256 MiB read
+within 0.6 ms of its wall time. The ladder's `bridge`, `read` and `read_bytes`
+rungs and the 200-file storm are unchanged, since a completion ends the wait
+before either timeout matters there.
