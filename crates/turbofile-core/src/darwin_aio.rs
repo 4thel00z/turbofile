@@ -132,7 +132,8 @@ fn driver_gone() -> io::Error {
 enum Wake {
     Msg(Msg),
     Opened(Opened),
-    Closed,
+    SubmittersGone,
+    HelpersGone,
 }
 
 struct FileEntry {
@@ -226,6 +227,7 @@ struct Driver {
     back_rx: flume::Receiver<Opened>,
     pending_opens: HashSet<u64>,
     cancelled_opens: HashSet<u64>,
+    helpers_gone: bool,
     files: HashMap<u64, FileEntry>,
     next_id: u64,
     inflight: Vec<Inflight>,
@@ -248,6 +250,7 @@ impl Driver {
             back_rx,
             pending_opens: HashSet::new(),
             cancelled_opens: HashSet::new(),
+            helpers_gone: false,
             files: HashMap::new(),
             next_id: 1,
             inflight: Vec::new(),
@@ -284,26 +287,45 @@ impl Driver {
     }
 
     /// Block until a submission or an opened descriptor arrives. Once the
-    /// submitters are gone only the helpers can still have something to say.
+    /// submitters are gone only the helpers can still have something to say;
+    /// once the helpers are gone only the submitters can.
     fn wait_idle(&mut self) {
         if self.disconnected {
             match self.back_rx.recv() {
                 Ok(opened) => self.handle_opened(opened),
-                Err(_) => self.pending_opens.clear(),
+                Err(_) => self.lose_helpers(),
+            }
+            return;
+        }
+        if self.helpers_gone {
+            match self.rx.recv() {
+                Ok(msg) => self.handle_msg(msg),
+                Err(_) => self.disconnected = true,
             }
             return;
         }
         let wake = flume::Selector::new()
-            .recv(&self.rx, |msg| msg.map(Wake::Msg).unwrap_or(Wake::Closed))
+            .recv(&self.rx, |msg| {
+                msg.map(Wake::Msg).unwrap_or(Wake::SubmittersGone)
+            })
             .recv(&self.back_rx, |opened| {
-                opened.map(Wake::Opened).unwrap_or(Wake::Closed)
+                opened.map(Wake::Opened).unwrap_or(Wake::HelpersGone)
             })
             .wait();
         match wake {
             Wake::Msg(msg) => self.handle_msg(msg),
             Wake::Opened(opened) => self.handle_opened(opened),
-            Wake::Closed => self.disconnected = true,
+            Wake::SubmittersGone => self.disconnected = true,
+            Wake::HelpersGone => self.lose_helpers(),
         }
+    }
+
+    /// Every helper thread has exited, which nothing in `helper_loop` can
+    /// cause today. Opens still out never come back; from here every job the
+    /// helpers would have taken runs on this thread instead.
+    fn lose_helpers(&mut self) {
+        self.helpers_gone = true;
+        self.pending_opens.clear();
     }
 
     fn suspend(&self) {
@@ -350,8 +372,15 @@ impl Driver {
                 }
             }
         }
-        while let Ok(opened) = self.back_rx.try_recv() {
-            self.handle_opened(opened);
+        loop {
+            match self.back_rx.try_recv() {
+                Ok(opened) => self.handle_opened(opened),
+                Err(flume::TryRecvError::Empty) => return,
+                Err(flume::TryRecvError::Disconnected) => {
+                    self.lose_helpers();
+                    return;
+                }
+            }
         }
     }
 
@@ -546,19 +575,26 @@ impl Driver {
             spec,
             pending,
         };
-        match self.helper_tx.send(job) {
-            Ok(()) => {}
-            Err(flume::SendError(HelperJob::Open {
+        if let Err(flume::SendError(job)) = self.helper_tx.send(job) {
+            self.pending_opens.remove(&id);
+            self.run_here(job);
+        }
+    }
+
+    /// A job the helpers could not take, run on this thread: an open settles
+    /// its op, a close closes.
+    fn run_here(&mut self, job: HelperJob) {
+        match job {
+            HelperJob::Open {
                 path,
                 spec,
                 pending,
-            })) => {
-                self.pending_opens.remove(&id);
+            } => {
                 let result = open_for(&path, &spec, &pending.then);
                 self.opened(pending, result);
             }
-            Err(_) => {
-                self.pending_opens.remove(&id);
+            HelperJob::Close(fd) => {
+                close_raw(fd).ok();
             }
         }
     }
@@ -629,8 +665,8 @@ impl Driver {
             close_raw(fd).ok();
             return;
         }
-        if self.helper_tx.send(HelperJob::Close(fd)).is_err() {
-            close_raw(fd).ok();
+        if let Err(flume::SendError(job)) = self.helper_tx.send(HelperJob::Close(fd)) {
+            self.run_here(job);
         }
     }
 
