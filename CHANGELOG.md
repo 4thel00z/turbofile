@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.1.4](https://github.com/4thel00z/turbofile/compare/v0.1.3...v0.1.4) (2026-09-08)
+
+
+### Bug Fixes
+
+* **darwin:** a message taken while idle counts toward the next wait ([da733ae](https://github.com/4thel00z/turbofile/commit/da733ae998fe81ab075bec938763ab549dd4c80c))
+* **darwin:** tell the two channels apart when the idle wait ends ([305a748](https://github.com/4thel00z/turbofile/commit/305a74837b6ce377068fc09ea3bae8f086b9baa2))
+
+
+### Performance Improvements
+
+* **darwin:** adaptive aio_suspend wait, 20 us to 160 us ([5531d31](https://github.com/4thel00z/turbofile/commit/5531d318ef824b7612c3c0011fef4beaa384039e))
+* **darwin:** adaptive aio_suspend wait, 20 us to 160 us ([2003152](https://github.com/4thel00z/turbofile/commit/2003152b2b0f46ecd8bf30258d6b54d074f88b8b))
+* **darwin:** end a read-to-end where fstat says the file ends ([51c32e0](https://github.com/4thel00z/turbofile/commit/51c32e04d099aa9320c968898b010f541993beda))
+* **darwin:** one AIO round trip per read-to-end ([b963ad8](https://github.com/4thel00z/turbofile/commit/b963ad84ada71d21014cf14110cb5fc562b5235f))
+* **darwin:** open on helper threads while the driver has a backlog ([b0bd2aa](https://github.com/4thel00z/turbofile/commit/b0bd2aa5469bbcb0823d6adb2fa105b0a7e4dc26))
+* **darwin:** open on helper threads while the driver has a backlog ([8323a76](https://github.com/4thel00z/turbofile/commit/8323a76c760b04f81df5f825787b771ecb0661d4))
+
+
+### Documentation
+
+* keep turbofile.dev's bench table in step with the README ([df3f1a2](https://github.com/4thel00z/turbofile/commit/df3f1a21476a38f7b97fcd4d59e8e23f730990b4))
+* keep turbofile.dev's bench table in step with the README ([814cdca](https://github.com/4thel00z/turbofile/commit/814cdcae98c12f184323bb03f4cb1a8103d9c35d))
+* one round trip per read-to-end, and the driver-thread read that did not pay ([e397eb6](https://github.com/4thel00z/turbofile/commit/e397eb6997d3c26efc7ab2c9f6907e63da294bce))
+* **perf:** the notice cliff, the waits measured, and the one that shipped ([cc39f4e](https://github.com/4thel00z/turbofile/commit/cc39f4e344e83643beac34fa1f5041972fed4490))
+* **perf:** the storm split, and opens off the driver thread ([a6b9123](https://github.com/4thel00z/turbofile/commit/a6b9123dd18e52ae4a0ac2457b8339cbca132ee7))
+
 ## [0.1.3](https://github.com/4thel00z/turbofile/compare/v0.1.2...v0.1.3) (2026-09-03)
 
 
