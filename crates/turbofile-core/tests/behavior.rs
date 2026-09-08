@@ -466,3 +466,242 @@ fn a_read_beside_a_slow_op_is_noticed_within_the_wait_cap() {
     );
     submit_wait(&driver, Op::Close { handle }).unwrap();
 }
+
+/// A FIFO with no writer blocks its reader's `open` until one appears, which
+/// stands in for any open that stalls: a cold path, an endpoint-security scan.
+/// Whole-file reads submitted around it must not wait behind it.
+#[cfg(target_os = "macos")]
+#[test]
+fn opens_that_block_do_not_hold_up_other_reads() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let cpath = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let payload = vec![7u8; 4096];
+    let files: Vec<_> = (0..8)
+        .map(|i| {
+            let path = dir.path().join(format!("r{i}.bin"));
+            std::fs::write(&path, &payload).unwrap();
+            path
+        })
+        .collect();
+    let driver = Driver::new(BackendKind::DarwinAio).unwrap();
+    let read_file = |path: &std::path::Path| Op::ReadFile {
+        path: path.to_path_buf(),
+        inline_max: u64::MAX,
+    };
+    submit_wait(&driver, read_file(&files[0])).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let (tx, rx) = mpsc::channel();
+    let (fifo_tx, fifo_rx) = mpsc::channel();
+    let batch = files.iter().chain(files.iter());
+    for (i, path) in batch.enumerate() {
+        if i == files.len() {
+            let fifo_tx = fifo_tx.clone();
+            driver.submit(
+                read_file(&fifo),
+                Box::new(move |result| fifo_tx.send(result).unwrap()),
+            );
+        }
+        let tx = tx.clone();
+        driver.submit(
+            read_file(path),
+            Box::new(move |result| tx.send(result).unwrap()),
+        );
+    }
+
+    let mut done = 0;
+    while done < 2 * files.len() {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(Reply::Bytes(bytes))) => assert_eq!(bytes, payload),
+            Ok(other) => panic!("expected bytes, got {other:?}"),
+            Err(_) => {
+                release_fifo(&fifo);
+                panic!(
+                    "{done} of {} regular reads completed while a FIFO open was blocking",
+                    2 * files.len()
+                );
+            }
+        }
+        done += 1;
+    }
+    release_fifo(&fifo);
+    drop(
+        fifo_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the FIFO read settles once a writer closes"),
+    );
+}
+
+/// Open the FIFO for writing on another thread (a writer's open blocks until a
+/// reader has it open), write one byte and close so the reader sees EOF.
+#[cfg(target_os = "macos")]
+fn release_fifo(fifo: &std::path::Path) {
+    let fifo = fifo.to_path_buf();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let mut writer = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+        writer.write_all(b"x").unwrap();
+    });
+}
+
+/// Under a backlog the opens run on helper threads and their descriptors and
+/// errors come back to the driver as messages. Every kind of whole-file op
+/// submitted in one burst must still settle the way it does alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_burst_of_whole_file_ops_settles_each_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let small = vec![9u8; 2048];
+    let large = vec![4u8; 1 << 16];
+    let small_paths: Vec<_> = (0..24)
+        .map(|i| {
+            let path = dir.path().join(format!("s{i}.bin"));
+            std::fs::write(&path, &small).unwrap();
+            path
+        })
+        .collect();
+    let large_path = dir.path().join("large.bin");
+    std::fs::write(&large_path, &large).unwrap();
+    let missing = dir.path().join("absent.bin");
+    let written = dir.path().join("written.bin");
+    let driver = Driver::new(BackendKind::DarwinAio).unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let submit = |tag: &'static str, op: Op| {
+        let tx = tx.clone();
+        driver.submit(op, Box::new(move |result| tx.send((tag, result)).unwrap()));
+    };
+    for (i, path) in small_paths.iter().enumerate() {
+        submit(
+            "small",
+            Op::ReadFile {
+                path: path.clone(),
+                inline_max: u64::MAX,
+            },
+        );
+        match i {
+            6 => submit(
+                "missing",
+                Op::ReadFile {
+                    path: missing.clone(),
+                    inline_max: u64::MAX,
+                },
+            ),
+            12 => submit(
+                "handle",
+                Op::ReadFile {
+                    path: large_path.clone(),
+                    inline_max: 4096,
+                },
+            ),
+            18 => submit(
+                "written",
+                Op::WriteFile {
+                    path: written.clone(),
+                    data: Payload::Owned(large.clone()),
+                },
+            ),
+            _ => {}
+        }
+    }
+    drop(tx);
+
+    let mut smalls = 0;
+    let mut seen = Vec::new();
+    for (tag, result) in rx {
+        match (tag, result) {
+            ("small", Ok(Reply::Bytes(bytes))) => {
+                assert_eq!(bytes, small);
+                smalls += 1;
+            }
+            ("missing", Err(e)) => {
+                assert_eq!(e.kind(), io::ErrorKind::NotFound);
+                seen.push(tag);
+            }
+            ("handle", Ok(Reply::Handle { id, size, .. })) => {
+                assert_eq!(size, large.len() as u64);
+                match submit_wait(&driver, Op::ReadToEnd { handle: id, pos: 0 }).unwrap() {
+                    Reply::Bytes(bytes) => assert_eq!(bytes, large),
+                    other => panic!("expected bytes, got {other:?}"),
+                }
+                submit_wait(&driver, Op::Close { handle: id }).unwrap();
+                seen.push(tag);
+            }
+            ("written", Ok(Reply::Written { n, end })) => {
+                assert_eq!((n, end), (large.len(), large.len() as u64));
+                assert_eq!(std::fs::read(&written).unwrap(), large);
+                seen.push(tag);
+            }
+            (tag, other) => panic!("{tag}: unexpected result {other:?}"),
+        }
+    }
+    assert_eq!(smalls, small_paths.len());
+    seen.sort();
+    assert_eq!(seen, ["handle", "missing", "written"]);
+}
+
+/// An op whose open is still out at a helper thread has no queued job and no
+/// aiocb for a cancel to find; the cancel must still win when the open comes
+/// back.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_cancel_during_a_blocked_open_settles_cancelled() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let cpath = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let files: Vec<_> = (0..8)
+        .map(|i| {
+            let path = dir.path().join(format!("r{i}.bin"));
+            std::fs::write(&path, vec![1u8; 512]).unwrap();
+            path
+        })
+        .collect();
+    let driver = Driver::new(BackendKind::DarwinAio).unwrap();
+    let read_file = |path: &std::path::Path| Op::ReadFile {
+        path: path.to_path_buf(),
+        inline_max: u64::MAX,
+    };
+    submit_wait(&driver, read_file(&files[0])).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    let (tx, rx) = mpsc::channel();
+    for path in &files {
+        let tx = tx.clone();
+        driver.submit(
+            read_file(path),
+            Box::new(move |result| tx.send(result).unwrap()),
+        );
+    }
+    let (fifo_tx, fifo_rx) = mpsc::channel();
+    let fifo_id = driver.submit(
+        read_file(&fifo),
+        Box::new(move |result| fifo_tx.send(result).unwrap()),
+    );
+    for _ in &files {
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("regular reads complete beside the blocked open")
+            .unwrap();
+    }
+
+    driver.cancel(fifo_id);
+    std::thread::sleep(Duration::from_millis(20));
+    release_fifo(&fifo);
+    let result = fifo_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the FIFO op settles once a writer closes");
+    match result {
+        Err(e) if turbofile_core::is_cancelled(&e) => {}
+        other => panic!("expected ECANCELED, got {other:?}"),
+    }
+}

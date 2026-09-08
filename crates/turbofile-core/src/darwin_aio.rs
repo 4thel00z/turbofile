@@ -2,13 +2,16 @@
 //! completions with a timed `aio_suspend` loop; XNU has no kqueue completion
 //! delivery, so the timeout doubles as the new-submission latency bound. The
 //! timeout adapts: short after a pass that reaped a completion or handled a
-//! message, doubling toward a cap while nothing moves.
+//! message, doubling toward a cap while nothing moves. Opens run on the driver
+//! thread while it has nothing else waiting; under a backlog they go to a few
+//! helper threads and the descriptors come back as messages, so a burst of
+//! whole-file ops is not serialized behind one thread's `open` calls.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
     bad_handle, cancelled_error, regular_file_size, Callback, Dest, Msg, Op, OpenSpec, Payload,
@@ -29,11 +32,108 @@ const SUSPEND_MAX_NS: i64 = 160_000;
 /// it keeps the pending queue in userspace where it is observable.
 const FALLBACK_MAX_INFLIGHT: usize = 16;
 
+/// Bounds on the threads that run `open` (and the close of a descriptor the
+/// driver owns) while the driver has a backlog. An open costs several
+/// microseconds of kernel and endpoint-security work per file and does not
+/// scale on one thread; the completions still go through the single
+/// `aio_suspend` loop. One helper per four hardware threads: on a 12-thread
+/// machine three helpers beat two, four and six on a 200-file burst, since
+/// the driver, the event loop and the kernel's AIO threads want cores too.
+const MIN_OPEN_THREADS: usize = 2;
+const MAX_OPEN_THREADS: usize = 4;
+
 pub(crate) fn spawn(rx: flume::Receiver<Msg>) -> io::Result<()> {
+    let (helper_tx, helper_rx) = flume::unbounded();
+    let (back_tx, back_rx) = flume::unbounded();
+    for _ in 0..open_threads() {
+        let jobs = helper_rx.clone();
+        let back = back_tx.clone();
+        std::thread::Builder::new()
+            .name("turbofile-open".into())
+            .spawn(move || helper_loop(jobs, back))?;
+    }
     std::thread::Builder::new()
         .name("turbofile-aio".into())
-        .spawn(move || Driver::new(rx).run())?;
+        .spawn(move || Driver::new(rx, helper_tx, back_rx).run())?;
     Ok(())
+}
+
+fn open_threads() -> usize {
+    let hardware = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (hardware / 4).clamp(MIN_OPEN_THREADS, MAX_OPEN_THREADS)
+}
+
+/// Work handed to a helper thread: an open whose descriptor comes back to the
+/// driver as an [`Opened`] message, or a close nothing waits for.
+enum HelperJob {
+    Open {
+        path: PathBuf,
+        spec: OpenSpec,
+        pending: PendingOpen,
+    },
+    Close(i32),
+}
+
+/// An op between its submission and its open: what the driver does with the
+/// descriptor once it exists.
+struct PendingOpen {
+    id: u64,
+    then: AfterOpen,
+    cb: Callback,
+}
+
+enum AfterOpen {
+    Handle,
+    ReadFile { inline_max: u64 },
+    WriteFile { data: Payload },
+}
+
+struct Opened {
+    pending: PendingOpen,
+    result: io::Result<(i32, u64)>,
+}
+
+fn helper_loop(jobs: flume::Receiver<HelperJob>, back: flume::Sender<Opened>) {
+    for job in jobs.iter() {
+        match job {
+            HelperJob::Close(fd) => {
+                close_raw(fd).ok();
+            }
+            HelperJob::Open {
+                path,
+                spec,
+                pending,
+            } => {
+                let result = open_for(&path, &spec, &pending.then);
+                let Err(flume::SendError(opened)) = back.send(Opened { pending, result }) else {
+                    continue;
+                };
+                if let Ok((fd, _)) = opened.result {
+                    close_raw(fd).ok();
+                }
+                (opened.pending.cb)(Err(driver_gone()));
+            }
+        }
+    }
+}
+
+/// The open an op needs: a write to a fresh file has no size worth asking for.
+fn open_for(path: &Path, spec: &OpenSpec, then: &AfterOpen) -> io::Result<(i32, u64)> {
+    match then {
+        AfterOpen::WriteFile { .. } => open_raw(path, spec).map(|fd| (fd, 0)),
+        AfterOpen::Handle | AfterOpen::ReadFile { .. } => open_sized(path, spec),
+    }
+}
+
+fn driver_gone() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "turbofile driver thread is gone")
+}
+
+enum Wake {
+    Msg(Msg),
+    Opened(Opened),
+    SubmittersGone,
+    HelpersGone,
 }
 
 struct FileEntry {
@@ -123,6 +223,11 @@ struct Inflight {
 
 struct Driver {
     rx: flume::Receiver<Msg>,
+    helper_tx: flume::Sender<HelperJob>,
+    back_rx: flume::Receiver<Opened>,
+    pending_opens: HashSet<u64>,
+    cancelled_opens: HashSet<u64>,
+    helpers_gone: bool,
     files: HashMap<u64, FileEntry>,
     next_id: u64,
     inflight: Vec<Inflight>,
@@ -134,9 +239,18 @@ struct Driver {
 }
 
 impl Driver {
-    fn new(rx: flume::Receiver<Msg>) -> Self {
+    fn new(
+        rx: flume::Receiver<Msg>,
+        helper_tx: flume::Sender<HelperJob>,
+        back_rx: flume::Receiver<Opened>,
+    ) -> Self {
         Self {
             rx,
+            helper_tx,
+            back_rx,
+            pending_opens: HashSet::new(),
+            cancelled_opens: HashSet::new(),
+            helpers_gone: false,
             files: HashMap::new(),
             next_id: 1,
             inflight: Vec::new(),
@@ -151,13 +265,10 @@ impl Driver {
     fn run(mut self) {
         loop {
             if self.inflight.is_empty() && self.queue.is_empty() {
-                if self.disconnected {
+                if self.disconnected && self.pending_opens.is_empty() {
                     return;
                 }
-                match self.rx.recv() {
-                    Ok(msg) => self.handle_msg(msg),
-                    Err(_) => return,
-                }
+                self.wait_idle();
             }
             if !self.inflight.is_empty() {
                 self.suspend();
@@ -173,6 +284,48 @@ impl Driver {
                 false => (self.suspend_ns * 2).min(SUSPEND_MAX_NS),
             };
         }
+    }
+
+    /// Block until a submission or an opened descriptor arrives. Once the
+    /// submitters are gone only the helpers can still have something to say;
+    /// once the helpers are gone only the submitters can.
+    fn wait_idle(&mut self) {
+        if self.disconnected {
+            match self.back_rx.recv() {
+                Ok(opened) => self.handle_opened(opened),
+                Err(_) => self.lose_helpers(),
+            }
+            return;
+        }
+        if self.helpers_gone {
+            match self.rx.recv() {
+                Ok(msg) => self.handle_msg(msg),
+                Err(_) => self.disconnected = true,
+            }
+            return;
+        }
+        let wake = flume::Selector::new()
+            .recv(&self.rx, |msg| {
+                msg.map(Wake::Msg).unwrap_or(Wake::SubmittersGone)
+            })
+            .recv(&self.back_rx, |opened| {
+                opened.map(Wake::Opened).unwrap_or(Wake::HelpersGone)
+            })
+            .wait();
+        match wake {
+            Wake::Msg(msg) => self.handle_msg(msg),
+            Wake::Opened(opened) => self.handle_opened(opened),
+            Wake::SubmittersGone => self.disconnected = true,
+            Wake::HelpersGone => self.lose_helpers(),
+        }
+    }
+
+    /// Every helper thread has exited, which nothing in `helper_loop` can
+    /// cause today. Opens still out never come back; from here every job the
+    /// helpers would have taken runs on this thread instead.
+    fn lose_helpers(&mut self) {
+        self.helpers_gone = true;
+        self.pending_opens.clear();
     }
 
     fn suspend(&self) {
@@ -212,13 +365,30 @@ impl Driver {
         loop {
             match self.rx.try_recv() {
                 Ok(msg) => self.handle_msg(msg),
-                Err(flume::TryRecvError::Empty) => return,
+                Err(flume::TryRecvError::Empty) => break,
                 Err(flume::TryRecvError::Disconnected) => {
                     self.disconnected = true;
+                    break;
+                }
+            }
+        }
+        loop {
+            match self.back_rx.try_recv() {
+                Ok(opened) => self.handle_opened(opened),
+                Err(flume::TryRecvError::Empty) => return,
+                Err(flume::TryRecvError::Disconnected) => {
+                    self.lose_helpers();
                     return;
                 }
             }
         }
+    }
+
+    /// Whether anything is waiting on this thread: submissions not yet taken,
+    /// jobs waiting for an AIO slot, or opens out at the helpers. While it is,
+    /// a blocking call on this thread holds all of it up.
+    fn has_backlog(&self) -> bool {
+        !self.rx.is_empty() || !self.queue.is_empty() || !self.pending_opens.is_empty()
     }
 
     fn handle_msg(&mut self, msg: Msg) {
@@ -230,8 +400,10 @@ impl Driver {
     }
 
     /// A queued job settles ECANCELED immediately; an inflight one gets
-    /// `aio_cancel` and is flagged so a surviving chunk is not resubmitted.
-    /// An unknown id already finished: nothing to do.
+    /// `aio_cancel` and is flagged so a surviving chunk is not resubmitted;
+    /// one still at its open on a helper thread is marked and settles
+    /// ECANCELED when the open comes back. An unknown id already finished:
+    /// nothing to do.
     fn cancel(&mut self, id: u64) {
         if let Some(pos) = self.queue.iter().position(|job| job.id == id) {
             let job = self.queue.remove(pos).expect("position is in bounds");
@@ -239,6 +411,9 @@ impl Driver {
             return;
         }
         let Some(entry) = self.inflight.iter_mut().find(|entry| entry.job.id == id) else {
+            if self.pending_opens.contains(&id) {
+                self.cancelled_opens.insert(id);
+            }
             return;
         };
         entry.job.cancelled = true;
@@ -248,7 +423,7 @@ impl Driver {
     fn handle_op(&mut self, id: u64, op: Op, cb: Callback) {
         match op {
             Op::Nop => cb(Ok(Reply::Unit)),
-            Op::Open { path, spec } => cb(self.open(&path, &spec)),
+            Op::Open { path, spec } => self.open_then(id, path, spec, AfterOpen::Handle, cb),
             Op::Close { handle } => self.close(handle, cb),
             Op::Size { handle } => cb(self
                 .with_fd(handle)
@@ -359,74 +534,140 @@ impl Driver {
                 ),
                 Err(e) => cb(Err(e)),
             },
-            Op::ReadFile { path, inline_max } => {
-                let opened = open_sized(
-                    &path,
-                    &OpenSpec {
-                        read: true,
-                        ..OpenSpec::default()
-                    },
-                );
-                let (fd, size) = match opened {
-                    Ok(opened) => opened,
-                    Err(e) => {
-                        cb(Err(e));
-                        return;
-                    }
-                };
-                if size > inline_max {
-                    cb(Ok(self.register(fd, size)));
-                    return;
-                }
-                self.enqueue(
-                    id,
-                    JobKind::Read(ReadJob {
-                        handle: None,
-                        fd,
-                        owned_fd: true,
-                        pos: 0,
-                        want: Want::ToEnd,
-                        buf: ReadBuf::Owned(Vec::with_capacity((size as usize).max(1))),
-                        filled: 0,
-                    }),
-                    None,
-                    cb,
-                );
+            Op::ReadFile { path, inline_max } => self.open_then(
+                id,
+                path,
+                OpenSpec {
+                    read: true,
+                    ..OpenSpec::default()
+                },
+                AfterOpen::ReadFile { inline_max },
+                cb,
+            ),
+            Op::WriteFile { path, data } => self.open_then(
+                id,
+                path,
+                OpenSpec {
+                    write: true,
+                    create: true,
+                    truncate: true,
+                    ..OpenSpec::default()
+                },
+                AfterOpen::WriteFile { data },
+                cb,
+            ),
+        }
+    }
+
+    /// Open on this thread when nothing else is waiting on it, so a lone op
+    /// pays no extra hop; under a backlog hand the open to a helper thread
+    /// and continue with the descriptor when it comes back as a message.
+    fn open_then(&mut self, id: u64, path: PathBuf, spec: OpenSpec, then: AfterOpen, cb: Callback) {
+        let pending = PendingOpen { id, then, cb };
+        if !self.has_backlog() {
+            let result = open_for(&path, &spec, &pending.then);
+            self.opened(pending, result);
+            return;
+        }
+        self.pending_opens.insert(id);
+        let job = HelperJob::Open {
+            path,
+            spec,
+            pending,
+        };
+        if let Err(flume::SendError(job)) = self.helper_tx.send(job) {
+            self.pending_opens.remove(&id);
+            self.run_here(job);
+        }
+    }
+
+    /// A job the helpers could not take, run on this thread: an open settles
+    /// its op, a close closes.
+    fn run_here(&mut self, job: HelperJob) {
+        match job {
+            HelperJob::Open {
+                path,
+                spec,
+                pending,
+            } => {
+                let result = open_for(&path, &spec, &pending.then);
+                self.opened(pending, result);
             }
-            Op::WriteFile { path, data } => {
-                let opened = open_raw(
-                    &path,
-                    &OpenSpec {
-                        write: true,
-                        create: true,
-                        truncate: true,
-                        ..OpenSpec::default()
-                    },
-                );
-                match opened {
-                    Ok(fd) => self.enqueue(
-                        id,
-                        JobKind::Write(WriteJob {
-                            handle: None,
-                            fd,
-                            owned_fd: true,
-                            pos: 0,
-                            append: false,
-                            data,
-                            filled: 0,
-                        }),
-                        None,
-                        cb,
-                    ),
-                    Err(e) => cb(Err(e)),
-                }
+            HelperJob::Close(fd) => {
+                close_raw(fd).ok();
             }
         }
     }
 
-    fn open(&mut self, path: &Path, spec: &OpenSpec) -> io::Result<Reply> {
-        let (fd, size) = open_sized(path, spec)?;
-        Ok(self.register(fd, size))
+    fn handle_opened(&mut self, opened: Opened) {
+        self.progress = true;
+        let id = opened.pending.id;
+        self.pending_opens.remove(&id);
+        if self.cancelled_opens.remove(&id) {
+            if let Ok((fd, _)) = opened.result {
+                close_raw(fd).ok();
+            }
+            (opened.pending.cb)(Err(cancelled_error()));
+            return;
+        }
+        self.opened(opened.pending, opened.result);
+    }
+
+    fn opened(&mut self, pending: PendingOpen, result: io::Result<(i32, u64)>) {
+        let PendingOpen { id, then, cb } = pending;
+        let (fd, size) = match result {
+            Ok(opened) => opened,
+            Err(e) => {
+                cb(Err(e));
+                return;
+            }
+        };
+        match then {
+            AfterOpen::Handle => cb(Ok(self.register(fd, size))),
+            AfterOpen::ReadFile { inline_max } if size > inline_max => {
+                cb(Ok(self.register(fd, size)))
+            }
+            AfterOpen::ReadFile { .. } => self.enqueue(
+                id,
+                JobKind::Read(ReadJob {
+                    handle: None,
+                    fd,
+                    owned_fd: true,
+                    pos: 0,
+                    want: Want::ToEnd,
+                    buf: ReadBuf::Owned(Vec::with_capacity((size as usize).max(1))),
+                    filled: 0,
+                }),
+                None,
+                cb,
+            ),
+            AfterOpen::WriteFile { data } => self.enqueue(
+                id,
+                JobKind::Write(WriteJob {
+                    handle: None,
+                    fd,
+                    owned_fd: true,
+                    pos: 0,
+                    append: false,
+                    data,
+                    filled: 0,
+                }),
+                None,
+                cb,
+            ),
+        }
+    }
+
+    /// Close a descriptor only this driver knows about. Nothing waits for
+    /// it, so under a backlog a helper thread takes the call.
+    fn close_owned(&mut self, fd: i32) {
+        if !self.has_backlog() {
+            close_raw(fd).ok();
+            return;
+        }
+        if let Err(flume::SendError(job)) = self.helper_tx.send(HelperJob::Close(fd)) {
+            self.run_here(job);
+        }
     }
 
     /// Take ownership of an open descriptor as a new handle.
@@ -638,7 +879,7 @@ impl Driver {
             JobKind::Fsync(fsync) => (Some(fsync.handle), false, fsync.fd),
         };
         if owned_fd {
-            close_raw(fd).ok();
+            self.close_owned(fd);
         }
         (job.cb)(result);
         let Some(handle) = handle else {
