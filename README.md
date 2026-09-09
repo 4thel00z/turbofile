@@ -74,6 +74,12 @@ async def main() -> None:
 async iteration, `readinto`, `truncate`, `fsync` via `sync`. Migration is
 `import turbofile as aiofiles` for the `open` API.
 
+Inside a running loop, `read_bytes` and `write_bytes` return the completion
+future itself rather than a coroutine, so `asyncio.gather` over many files
+schedules no task per file. They can still be awaited directly or wrapped in
+`asyncio.create_task`; outside a loop they return a coroutine, so
+`asyncio.run(turbofile.read_bytes(path))` works too.
+
 ## Benchmarks
 
 `make bench` compares against aiofiles on your machine: p50 per operation,

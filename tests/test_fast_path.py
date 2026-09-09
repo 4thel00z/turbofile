@@ -285,8 +285,10 @@ async def test_missing_file_raises_through_fallback(workdir: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_directory_is_not_served_by_fast_path(workdir: Path) -> None:
-    """try_read_file must decline non-regular files rather than invent bytes."""
-    assert _turbofile.try_read_file(str(workdir)) is None
+    """The inline whole-file read, on the platform that has one, must decline
+    non-regular files rather than invent bytes; the async path reports the error."""
+    if turbofile.read_file_inline:
+        assert turbofile.read_file_inline(str(workdir)) is None
     with pytest.raises(OSError):
         await turbofile.read_bytes(workdir)
 

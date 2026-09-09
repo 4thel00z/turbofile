@@ -4,6 +4,7 @@
 //! with the same operations; `None` from any of them means "take the async
 //! path", never an error, and the async path stays authoritative for errors.
 
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 use pyo3::buffer::PyBuffer;
@@ -127,17 +128,11 @@ impl FastPath {
 /// Whole-file fast path by path: open, size, read and close on the calling
 /// thread with every step refusing to block. Returns `None` whenever any step
 /// would have blocked, leaving the caller to submit the ordinary async read.
+/// Only Linux has a cached-only `open` (`openat2(RESOLVE_CACHED)`); on Darwin
+/// an inline `open` stalls on cold paths and endpoint-security scans, so the
+/// function does not exist there and `read_bytes` submits straight away.
 #[cfg(target_os = "linux")]
 #[pyfunction]
 pub(crate) fn try_read_file(py: Python<'_>, path: PathBuf) -> PyResult<Option<PyObject>> {
     linux::read_file(py, path)
-}
-
-/// Only Linux has a cached-only `open` (`openat2(RESOLVE_CACHED)`). On Darwin
-/// an inline `open` stalls on cold paths and endpoint-security scans, so
-/// `read_bytes` keeps the async path there.
-#[cfg(not(target_os = "linux"))]
-#[pyfunction]
-pub(crate) fn try_read_file(_py: Python<'_>, _path: PathBuf) -> PyResult<Option<PyObject>> {
-    Ok(None)
 }

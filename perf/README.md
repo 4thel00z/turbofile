@@ -232,9 +232,10 @@ repeated.
 
 The darwin driver has two ways to sleep. With nothing in flight it blocks on
 the submission channel and a new op wakes it at once. With ops in flight it
-blocks in `aio_suspend`, which only a completion or its timeout can end; XNU
-delivers no AIO completions through `kqueue`, and `aio_suspend` watches no file
-descriptor, so the channel cannot reach it. An op submitted while the only
+blocks in `aio_suspend`, which only a completion or its timeout can end; the
+driver takes no completions through `kqueue` (XNU gained that route in macOS
+26, measured further down), and `aio_suspend` watches no file descriptor, so
+the channel cannot reach it. An op submitted while the only
 things in flight are slow therefore waited for the fixed 1 ms timeout.
 
 Measured with a hot 4 KiB read through the driver path (`_turbofile.read` on
@@ -349,3 +350,99 @@ when that workload runs alone). The ladder's `read_bytes` (41.4 µs min) and
 build, and a read beside a slow op still takes 29 to 32 µs p50 and 158 to
 188 µs p99. Of the 1.4 ms that remain, 0.9 ms is the event loop's 200
 coroutines and the bridge.
+
+
+### The task per gathered file
+
+With opens off the driver thread, the storm's remaining time split three ways
+that were all within reach of each other. Per-thread CPU per storm over 200
+storms, from mach `thread_info` on each thread of the process, taken with a
+load average near 6 from other work on the machine, so the kernel-side numbers
+run high:
+
+| thread | CPU per storm |
+| ------ | ------------- |
+| event loop | 1.16 ms |
+| driver | 0.81 ms |
+| each of three open helpers | 1.41 ms, all but 50 us of it in the kernel |
+
+The loop's share is Python and asyncio. `asyncio.gather` wraps every
+coroutine it is handed in a Task: an allocation, a `call_soon` for the first
+step, the step, a wakeup and a second step when the awaited future settles,
+then the Task's own done callbacks. A future handed to `gather` gets one done
+callback. Per gathered item, min and p50 over 300 rounds of 200 items, on the
+previous build:
+
+| gathered item | min | p50 |
+| ------------- | --- | --- |
+| a coroutine that returns at once | 1.85 us | 2.39 us |
+| a resolved future | 0.44 us | 0.48 us |
+| a `probe_nop` future (the bridge round trip, no I/O) | 1.33 us | 1.68 us |
+| a coroutine awaiting `probe_nop` | 3.05 us | 3.41 us |
+| a `read_bytes` coroutine, hot 16 KiB file | 6.78 us | 8.28 us |
+
+`read_bytes` and `write_bytes` were coroutines that awaited one future and
+returned its value; the only work after the await was the large-file handoff.
+Inside a running loop they now return the completion future itself. The
+handoff moved into the drain: a `read_file` above `inline_max` calls a Python
+continuation with the open handle, which starts an eagerly started task for
+the parallel fill and settles the future from that task's outcome. Eager start
+matters: a cancel thrown into a coroutine that has not started skips its
+`finally`, and the first version leaked the descriptor in exactly that case.
+The future also answers `send`, `throw` and `close`, which is what
+`asyncio.create_task` needs to drive it like a coroutine, so wrapping
+`read_bytes` in a task keeps working and a cancelled task still waits for the
+kernel op to settle before it raises. Outside a loop both functions return a
+coroutine, so `asyncio.run(turbofile.read_bytes(p))` works as before.
+
+Two smaller cuts on the same path: the future class has `__slots__`, so no
+per-future `__dict__` is allocated when the drain stores its op ids, and the
+drain no longer asks `done()` before settling, since nothing but the drain
+settles a kernel future. Together they take the `probe_nop` item from 1.33 to
+1.10 us.
+
+Result, the previous build against this one as wheels in two venvs, three
+interleaved legs of 200 storms each, load average 5 to 6:
+
+| build | storm min | storm p50 | loop CPU per storm |
+| ----- | --------- | --------- | ------------------ |
+| coroutines (before) | 1.32 to 1.35 ms | 1.39 to 1.52 ms | 1.08 to 1.21 ms |
+| futures (this change) | 1.19 to 1.20 ms | 1.25 to 1.33 ms | 0.80 to 0.90 ms |
+
+The loop's CPU per storm drops by a quarter and the wall time by a tenth: the
+driver and the helpers now hold the storm's floor, so the rest of the loop's
+saving shows up as idle time, not speed.
+
+### kqueue completions and list submission, measured
+
+XNU on macOS 26 accepts `SIGEV_KEVENT` in an aiocb's `aio_sigevent`, with the
+kqueue descriptor in `sigev_signo`; the completion arrives as an `EVFILT_AIO`
+event whose `ident` is the aiocb, `udata` the `sival_ptr`, and `ext[0]` and
+`ext[1]` the errno and return value, so `kevent64` is needed to see them. The
+kernel consumes the request when it delivers the event, and `aio_return`
+afterwards fails with EINVAL. The note under the notice cliff above, that XNU delivers
+no AIO completions through kqueue, was true of earlier releases and is not
+true of this one. Whether it buys the driver anything, one thread, per op:
+
+| path | min | p50 |
+| ---- | --- | --- |
+| lone op: `aio_read`, `aio_suspend`, `aio_error`, `aio_return` | 2.75 us | 4.58 us |
+| lone op: `aio_read`, `kevent64` | 2.21 us | 2.83 us |
+| 16 in flight: suspend, `aio_error` scan, `aio_return` | 0.90 us | 1.66 us |
+| 16 in flight: `kevent64` | 1.38 us | 2.07 us |
+| lone op seen through an outer kqueue watching the inner one | 2.67 us | 3.38 us |
+
+A lone op saves under two microseconds; a batch loses, since every submission
+also registers a knote under a global lock, and the storm's driver time is
+batches. The driver keeps `aio_suspend`. The kevent path would still remove
+the notice cliff, because the driver could wait for completions and a doorbell
+in one call, and a kqueue can be watched by another kqueue, so completions
+could reach the event loop's own selector; an outer wait with no timeout hung
+once in that probe, so a design on it needs a bounded wait.
+
+`lio_listio(LIO_NOWAIT)` submits up to 16 requests in one call. For 16 hot
+4 KiB reads, min over 1000 rounds: submission 4.1 us against 9.6 us for
+sixteen `aio_read` calls, but 19.9 us against 15.6 us from submission to the
+last reap, so the batch runs on fewer kernel workers than sixteen separate
+wakeups get it. With the process cap full the whole list fails with EAGAIN and
+nothing is queued. Not used.
