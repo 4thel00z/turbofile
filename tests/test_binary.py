@@ -1,5 +1,9 @@
 """Binary-mode behavior of turbofile.open."""
 
+import asyncio
+import inspect
+from typing import Any
+
 import pytest
 
 import turbofile
@@ -165,3 +169,89 @@ async def test_invalid_modes_raise(tmp_path) -> None:
         await turbofile.open(path, "rb", newline="\n")
     with pytest.raises(ValueError):
         await turbofile.open(path, "r", buffering=0)
+
+
+def counting_task_factory(created: list[Any]) -> Any:
+    def factory(
+        loop: asyncio.AbstractEventLoop, coro: Any, context: Any = None
+    ) -> asyncio.Task[Any]:
+        created.append(coro)
+        return asyncio.Task(coro, loop=loop, context=context)
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_read_at_in_a_running_loop_is_a_future(tmp_path) -> None:
+    path = tmp_path / "at.bin"
+    payload = bytes(range(256)) * 16
+    path.write_bytes(payload)
+    async with turbofile.open(path, "rb") as f:
+        pending = f.read_at(256, 512)
+        assert asyncio.isfuture(pending)
+        assert await pending == payload[256:768]
+        assert await f.tell() == 0
+        assert await asyncio.create_task(f.read_at(0, 4)) == payload[:4]
+
+
+@pytest.mark.asyncio
+async def test_gathering_read_at_makes_no_task_per_read(tmp_path) -> None:
+    path = tmp_path / "gathered.bin"
+    payload = bytes(range(256)) * 64
+    path.write_bytes(payload)
+    offsets = [(i * 7919 * 256) % (len(payload) - 256) for i in range(32)]
+    loop = asyncio.get_running_loop()
+    created: list[Any] = []
+    async with turbofile.open(path, "rb") as f:
+        loop.set_task_factory(counting_task_factory(created))
+        try:
+            chunks = await asyncio.gather(*(f.read_at(off, 256) for off in offsets))
+        finally:
+            loop.set_task_factory(None)
+    assert chunks == [payload[off : off + 256] for off in offsets]
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_read_at_without_the_fast_path_is_the_kernel_future(tmp_path) -> None:
+    path = tmp_path / "kernel.bin"
+    payload = b"k" * 8192
+    path.write_bytes(payload)
+    async with turbofile.open(path, "rb") as f:
+        f.fast = None
+        pending = f.read_at(4096, 4096)
+        assert asyncio.isfuture(pending)
+        assert not pending.done()
+        assert await pending == payload[4096:]
+        sink = bytearray(100)
+        filling = f.readinto_at(10, sink)
+        assert asyncio.isfuture(filling)
+        assert await filling == 100
+        assert bytes(sink) == payload[10:110]
+
+
+@pytest.mark.asyncio
+async def test_readinto_at_in_a_running_loop_is_a_future(tmp_path) -> None:
+    path = tmp_path / "into.bin"
+    payload = bytes(range(256)) * 4
+    path.write_bytes(payload)
+    async with turbofile.open(path, "rb") as f:
+        sink = bytearray(300)
+        filling = f.readinto_at(100, sink)
+        assert asyncio.isfuture(filling)
+        assert await filling == 300
+        assert bytes(sink) == payload[100:400]
+
+
+def test_read_at_outside_a_loop_is_a_coroutine(tmp_path) -> None:
+    path = tmp_path / "later.bin"
+    payload = b"positional, awaited later"
+    path.write_bytes(payload)
+    async def opened() -> Any:
+        return await turbofile.open(path, "rb")
+
+    f = asyncio.run(opened())
+    pending = f.read_at(12, 7)
+    assert inspect.iscoroutine(pending)
+    assert asyncio.run(pending) == payload[12:19]
+    asyncio.run(f.close())

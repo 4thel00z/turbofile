@@ -80,6 +80,12 @@ schedules no task per file. They can still be awaited directly or wrapped in
 `asyncio.create_task`; outside a loop they return a coroutine, so
 `asyncio.run(turbofile.read_bytes(path))` works too.
 
+`f.read_at(pos, n)` and `f.readinto_at(pos, buffer)` read at a position
+without moving the file's own. Inside a running loop they return the
+completion future as well, and pages already resident settle it at once, so
+`asyncio.gather` over many positions reads them concurrently with no task per
+read.
+
 ## Benchmarks
 
 `make bench` compares against aiofiles on your machine: p50 per operation,
@@ -109,9 +115,10 @@ Reads whose pages are already resident never leave the event-loop thread: no
 submission, no driver-thread hop, no completion wakeup. On Linux the kernel
 decides, through `preadv2(RWF_NOWAIT)`; on macOS `mincore` on a mapping of the
 file reports which pages the buffer cache holds, and a plain `pread` copies
-them. Data that is not resident takes the async path. `make ladder` isolates
-that read: its `file_read` rung is `BinaryFile`'s positional read of a hot
-4 KiB, its `pread` rung the blocking syscall for the same bytes.
+them. Data that is not resident takes the async path. The table's 32
+concurrent random reads take this route through `read_at`. `make ladder`
+isolates the read: its `file_read` rung is `BinaryFile`'s positional read of a
+hot 4 KiB, its `pread` rung the blocking syscall for the same bytes.
 
 | platform    | `file_read` | `pread` |
 | ----------- | ----------- | ------- |

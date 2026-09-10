@@ -131,17 +131,15 @@ async def bench_random_reads(dirpath: str, concurrency: int, runs: int) -> None:
             for off in offsets:
                 await one(off)
 
-    handle, _, _ = await _turbofile.open(path, True, False, False, False, False, False)
+    tf = await turbofile.open(path, "rb")
 
     async def with_turbofile() -> None:
-        await asyncio.gather(
-            *(_turbofile.read(handle, off, chunk) for off in offsets)
-        )
+        await asyncio.gather(*(tf.read_at(off, chunk) for off in offsets))
 
     per_run = chunk * concurrency
     base = report("aiofiles (sequential)", await timed(runs, with_aiofiles), per_run, None)
-    report("turbofile (gathered)", await timed(runs, with_turbofile), per_run, base)
-    await _turbofile.close(handle)
+    report("turbofile (gathered read_at)", await timed(runs, with_turbofile), per_run, base)
+    await tf.close()
     print()
 
 
