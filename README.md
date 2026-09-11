@@ -95,7 +95,7 @@ page-cache-hot files, mains power):
 | workload                                   | vs aiofiles |
 | ------------------------------------------ | ----------- |
 | 4 KiB read on an open file                 | 59x         |
-| 32 concurrent 4 KiB random reads           | 23x         |
+| 32 concurrent 4 KiB random reads           | 55x         |
 | 200 small files read concurrently          | 14.0x       |
 | 4 KiB whole-file read (`read_bytes`)       | 3.5x        |
 | 8 MiB whole-file read (`read_bytes`)       | 1.4x        |
@@ -123,7 +123,7 @@ hot 4 KiB, its `pread` rung the blocking syscall for the same bytes.
 | platform    | `file_read` | `pread` |
 | ----------- | ----------- | ------- |
 | Linux, ext4 | 1.3 us      | 1.1 us  |
-| macOS, APFS | 1.1 us      | 0.6 us  |
+| macOS, APFS | 1.2 us      | 0.5 us  |
 
 On Linux `read_bytes` takes the same inline route for the whole file, open
 included, through `openat2(RESOLVE_CACHED)`: 5.3 us for a hot 4 KiB file. macOS
