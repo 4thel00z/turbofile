@@ -97,9 +97,9 @@ page-cache-hot files, mains power):
 | 8 MiB sequential write (1 MiB chunks)      | 1.0x        |
 
 Both 8 MiB reads finish in about 0.31 ms, against 0.27 ms for a blocking
-`read` of the same bytes and 0.44 ms for aiofiles: at that size every
-implementation is mostly the page-cache copy, and the thread hop is a small
-part of it. The sixteen chunks copying in parallel on the kernel's AIO threads
+`read` of the same bytes and 0.44 ms for aiofiles: at that size the copy is
+the floor and aiofiles pays its thread hop on top of it. The sixteen chunks
+copying in parallel on the kernel's AIO threads
 show at 64 MiB, where the parallel fill takes 2.7 ms against 8.9 ms for a read
 in a thread. Sequential writes await one chunk at a time, so one copy is in
 flight and the write row sits at the copy as well; turbofile wins where per-op

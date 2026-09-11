@@ -362,8 +362,8 @@ coroutines and the bridge.
 With opens off the driver thread, the storm's remaining time split across
 threads that were all within reach of each other. Per-thread CPU per storm
 over 200 storms, from mach `thread_info` on each thread of the process, on a
-quiet machine (load average 1.8 to 2.1 before the run; the storm's own threads
-lift it to about 3 while it runs):
+quiet machine (one-minute load average 2.1 to 2.5 as the run started and about
+3 while it ran, with the CPU calibration loop steady before and after):
 
 | thread | coroutines (before) | futures (this change) |
 | ------ | ------------------- | --------------------- |
@@ -406,7 +406,8 @@ Two smaller cuts on the same path: the future class has `__slots__`, so no
 per-future `__dict__` is allocated when the drain stores its op ids, and the
 drain no longer asks `done()` before settling, since nothing but the drain
 settles a kernel future. Together they take the `probe_nop` item from 1.23 to
-1.09 us, and the `read_bytes` item from 6.61 to 5.71 us.
+1.09 us. The `read_bytes` item goes from 6.61 to 5.71 us, most of that from
+the Task that is no longer created.
 
 Result, the previous build against this one as wheels in two venvs, three
 interleaved legs of 200 storms each, same quiet machine:
