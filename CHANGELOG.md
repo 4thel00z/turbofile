@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.5](https://github.com/4thel00z/turbofile/compare/v0.1.4...v0.1.5) (2026-09-11)
+
+
+### Performance Improvements
+
+* **darwin-aio:** one open helper per three hardware threads ([80817ad](https://github.com/4thel00z/turbofile/commit/80817ad3f0902153e61b20054c94b72a4e8f3880))
+* **darwin-aio:** one open helper per three hardware threads ([290b57a](https://github.com/4thel00z/turbofile/commit/290b57ae63f6163457c6ac12d2e5ab16578de8a2))
+* **python:** read_at and readinto_at return the completion future ([487e214](https://github.com/4thel00z/turbofile/commit/487e21404faadfe8157bcca7ca926867f7c2eb7f))
+* **python:** read_at and readinto_at return the completion future ([c9827b9](https://github.com/4thel00z/turbofile/commit/c9827b93c3eefa79b5f9f15a2221edb356d940d8))
+* **python:** read_bytes and write_bytes return the completion future ([fbd6a1a](https://github.com/4thel00z/turbofile/commit/fbd6a1a29d2f24c01cbf4f23255f95c374ad6c71))
+* **python:** read_bytes and write_bytes return the completion future ([a82d00e](https://github.com/4thel00z/turbofile/commit/a82d00e7be719c0603a5d4ad3090c6a104fb2fd5))
+
+
+### Documentation
+
+* **perf:** credit the read_bytes item drop to the removed task, state the 8 MiB hop as measured ([a8152dc](https://github.com/4thel00z/turbofile/commit/a8152dc903fee328f39f127a94ba3437b50f13cc))
+* **perf:** quiet-machine numbers for future-returning positional reads ([90ac66b](https://github.com/4thel00z/turbofile/commit/90ac66bb830ca2c05d952023537b4e3a10734d54))
+* **perf:** quiet-machine numbers for the future-returning whole-file ops ([542f14b](https://github.com/4thel00z/turbofile/commit/542f14b7ae11b9ffdc359802a924b20cc10d0684))
+
 ## [0.1.4](https://github.com/4thel00z/turbofile/compare/v0.1.3...v0.1.4) (2026-09-08)
 
 
