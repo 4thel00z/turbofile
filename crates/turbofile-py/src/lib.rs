@@ -41,24 +41,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// `cancel()` forwards an abort request for the future's kernel ops (their
-/// ids sit in `op_ids`) and returns False: the future settles when the ops
-/// do, promptly on abort, so caller buffers are never touched after the
-/// `await` raises. `deliver` turns an ECANCELED settle into a real
-/// cancellation via `settle_cancelled`.
+/// The future every submission returns: `turbofile.futures.KernelFuture`,
+/// whose `cancel()` asks the driver to abort the ops in `op_ids` and whose
+/// `settle_cancelled()` is what `deliver` calls for an ECANCELED settle.
 fn kernel_future_class(py: Python<'_>) -> PyResult<&'static PyObject> {
     KERNEL_FUTURE.get_or_try_init(py, || {
-        let ns = PyDict::new(py);
-        ns.set_item("cancel_kernel_ops", wrap_pyfunction!(cancel_ops, py)?)?;
-        py.run(
-            c"import asyncio\n\nclass KernelFuture(asyncio.Future):\n    \"\"\"Completion of in-flight kernel ops; cancel() requests their abort.\"\"\"\n\n    def cancel(self, msg: object = None) -> bool:\n        if self.done():\n            return False\n        cancel_kernel_ops(self.op_ids)\n        return False\n\n    def settle_cancelled(self) -> bool:\n        return super().cancel()\n",
-            Some(&ns),
-            Some(&ns),
-        )?;
-        let class = ns
-            .get_item("KernelFuture")?
-            .ok_or_else(|| PyRuntimeError::new_err("KernelFuture class not defined"))?;
-        Ok(class.unbind())
+        Ok(py
+            .import("turbofile.futures")?
+            .getattr("KernelFuture")?
+            .unbind())
     })
 }
 
@@ -114,8 +105,18 @@ enum Owner {
 
 enum Output {
     Plain,
-    FillBytes { bytes: Py<PyBytes> },
+    FillBytes {
+        bytes: Py<PyBytes>,
+    },
     ReadInto,
+    /// `read_file`: bytes for a file up to `inline_max`. A larger file comes
+    /// back as an open handle, which goes to `on_handle(fut, handle, fd)` when
+    /// one was given; that callable settles the future itself later.
+    WholeFile {
+        on_handle: Option<PyObject>,
+    },
+    /// `write_file`: the count written, without the end offset.
+    WrittenCount,
 }
 
 struct Completion {
@@ -324,6 +325,9 @@ impl DrainHandle {
     }
 }
 
+/// The future is still pending here: nothing but this function settles it,
+/// and its `cancel()` only requests an abort. A settle that fails anyway
+/// (`InvalidStateError`) is dropped by the `.ok()`.
 fn deliver(py: Python<'_>, completion: Completion) {
     let Completion {
         fut,
@@ -332,30 +336,39 @@ fn deliver(py: Python<'_>, completion: Completion) {
         owner,
     } = completion;
     let fut = fut.bind(py);
-    let done = fut
-        .call_method0("done")
-        .and_then(|flag| flag.extract::<bool>())
-        .unwrap_or(true);
-    if !done {
-        match result {
-            Err(e) if is_cancelled(&e) => {
-                fut.call_method0("settle_cancelled").ok();
+    match result {
+        Err(e) if is_cancelled(&e) => {
+            fut.call_method0("settle_cancelled").ok();
+        }
+        Err(e) => {
+            let exc = io_err_to_pyerr(e).into_value(py);
+            fut.call_method1("set_exception", (exc,)).ok();
+        }
+        Ok(reply) => {
+            if let Err(e) = settle(py, fut, reply, output) {
+                fut.call_method1("set_exception", (e.into_value(py),)).ok();
             }
-            Err(e) => {
-                let exc = io_err_to_pyerr(e).into_value(py);
-                fut.call_method1("set_exception", (exc,)).ok();
-            }
-            Ok(reply) => match build_value(py, reply, output) {
-                Ok(value) => {
-                    fut.call_method1("set_result", (value,)).ok();
-                }
-                Err(e) => {
-                    fut.call_method1("set_exception", (e.into_value(py),)).ok();
-                }
-            },
         }
     }
     drop(owner);
+}
+
+/// Settle `fut` with the value `reply` stands for, or hand a whole-file
+/// read's open handle to its continuation, which settles the future itself.
+fn settle(py: Python<'_>, fut: &Bound<'_, PyAny>, reply: Reply, output: Output) -> PyResult<()> {
+    if let (
+        Output::WholeFile {
+            on_handle: Some(hook),
+        },
+        Reply::Handle { id, fd, .. },
+    ) = (&output, &reply)
+    {
+        hook.bind(py).call1((fut, *id, *fd))?;
+        return Ok(());
+    }
+    let value = build_value(py, reply, output)?;
+    fut.call_method1("set_result", (value,))?;
+    Ok(())
 }
 
 fn build_value(py: Python<'_>, reply: Reply, output: Output) -> PyResult<PyObject> {
@@ -371,6 +384,7 @@ fn build_value(py: Python<'_>, reply: Reply, output: Output) -> PyResult<PyObjec
         (Output::ReadInto, Reply::Read { n }) => any(py, n),
         (_, Reply::Bytes(data)) => Ok(PyBytes::new(py, &data).into_any().unbind()),
         (_, Reply::Handle { id, size, fd }) => any(py, (id, size, fd)),
+        (Output::WrittenCount, Reply::Written { n, .. }) => any(py, n),
         (_, Reply::Written { n, end }) => any(py, (n, end)),
         (_, Reply::Size(size)) => any(py, size),
         (_, Reply::Unit) => Ok(py.None()),
@@ -719,11 +733,24 @@ fn size(py: Python<'_>, handle: u64) -> PyResult<PyObject> {
 }
 
 /// Whole file as `bytes` in one submission when it is at most `inline_max`
-/// bytes; a larger file resolves to an open `(handle, size, fd)` instead, for
-/// the caller to fill with `read_parallel` and close.
+/// bytes. A larger file resolves to an open `(handle, size, fd)` instead, for
+/// the caller to fill with `read_parallel` and close; with `on_handle` given,
+/// the drain calls `on_handle(fut, handle, fd)` for it and that callable
+/// settles the future once the file is read.
 #[pyfunction]
-fn read_file(py: Python<'_>, path: PathBuf, inline_max: u64) -> PyResult<PyObject> {
-    submit(py, Op::ReadFile { path, inline_max }, Output::Plain, None)
+#[pyo3(signature = (path, inline_max, on_handle=None))]
+fn read_file(
+    py: Python<'_>,
+    path: PathBuf,
+    inline_max: u64,
+    on_handle: Option<PyObject>,
+) -> PyResult<PyObject> {
+    submit(
+        py,
+        Op::ReadFile { path, inline_max },
+        Output::WholeFile { on_handle },
+        None,
+    )
 }
 
 #[pyfunction]
@@ -735,7 +762,7 @@ fn write_file(py: Python<'_>, path: PathBuf, data: Bound<'_, PyAny>) -> PyResult
             path,
             data: payload,
         },
-        Output::Plain,
+        Output::WrittenCount,
         Some(owner),
     )
 }
@@ -841,6 +868,7 @@ fn _turbofile(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(read, m)?)?;
     m.add_class::<fast_path::FastPath>()?;
+    #[cfg(target_os = "linux")]
     m.add_function(wrap_pyfunction!(fast_path::try_read_file, m)?)?;
     m.add_function(wrap_pyfunction!(read_parallel, m)?)?;
     m.add_function(wrap_pyfunction!(read_to_end, m)?)?;

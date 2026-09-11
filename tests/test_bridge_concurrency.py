@@ -122,8 +122,7 @@ from turbofile import _turbofile
 
 async def main():
     assert _turbofile.backend_name().startswith("compio-")
-    n, end = await _turbofile.write_file({path!r}, b"override")
-    assert (n, end) == (8, 8)
+    assert await _turbofile.write_file({path!r}, b"override") == 8
     assert await _turbofile.read_file({path!r}, 1 << 40) == b"override"
 
 asyncio.run(main())

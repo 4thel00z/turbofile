@@ -64,8 +64,7 @@ async def test_missing_file_raises_file_not_found(tmp_path) -> None:
 async def test_read_file_and_write_file(tmp_path) -> None:
     path = str(tmp_path / "whole.bin")
     payload = b"\x00\x01turbo\xfffile"
-    n, end = await _turbofile.write_file(path, payload)
-    assert (n, end) == (len(payload), len(payload))
+    assert await _turbofile.write_file(path, payload) == len(payload)
     assert await _turbofile.read_file(path, 1 << 40) == payload
 
 

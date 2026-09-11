@@ -74,6 +74,12 @@ async def main() -> None:
 async iteration, `readinto`, `truncate`, `fsync` via `sync`. Migration is
 `import turbofile as aiofiles` for the `open` API.
 
+Inside a running loop, `read_bytes` and `write_bytes` return the completion
+future itself rather than a coroutine, so `asyncio.gather` over many files
+schedules no task per file. They can still be awaited directly or wrapped in
+`asyncio.create_task`; outside a loop they return a coroutine, so
+`asyncio.run(turbofile.read_bytes(path))` works too.
+
 ## Benchmarks
 
 `make bench` compares against aiofiles on your machine: p50 per operation,
@@ -82,21 +88,22 @@ page-cache-hot files, mains power):
 
 | workload                                   | vs aiofiles |
 | ------------------------------------------ | ----------- |
-| 4 KiB read on an open file                 | 55x         |
-| 32 concurrent 4 KiB random reads           | 25x         |
-| 200 small files read concurrently          | 12.6x       |
-| 4 KiB whole-file read (`read_bytes`)       | 3.1x        |
-| 8 MiB whole-file read (`read_bytes`)       | 2.4x        |
-| 8 MiB whole-file read (`open` + `read`)    | 2.4x        |
+| 4 KiB read on an open file                 | 59x         |
+| 32 concurrent 4 KiB random reads           | 23x         |
+| 200 small files read concurrently          | 14.0x       |
+| 4 KiB whole-file read (`read_bytes`)       | 3.5x        |
+| 8 MiB whole-file read (`read_bytes`)       | 1.4x        |
+| 8 MiB whole-file read (`open` + `read`)    | 1.5x        |
 | 8 MiB sequential write (1 MiB chunks)      | 1.0x        |
 
-Both 8 MiB reads finish in 0.33 ms, level with the 0.30 ms a blocking `read`
-of the same bytes takes, because sixteen chunks copy in parallel on the
-kernel's AIO threads; at 64 MiB the parallel fill takes 2.7 ms against 8.5 ms
-for a read in a thread. Sequential writes await one chunk at a time, so one
-copy is in flight and every implementation converges on the page-cache copy;
-turbofile wins where per-op overhead and concurrency dominate, which is what
-an asyncio application does.
+Both 8 MiB reads finish in about 0.31 ms, against 0.27 ms for a blocking
+`read` of the same bytes and 0.44 ms for aiofiles: at that size the copy is
+the floor and aiofiles pays its thread hop on top of it. The sixteen chunks
+copying in parallel on the kernel's AIO threads
+show at 64 MiB, where the parallel fill takes 2.7 ms against 8.9 ms for a read
+in a thread. Sequential writes await one chunk at a time, so one copy is in
+flight and the write row sits at the copy as well; turbofile wins where per-op
+overhead and concurrency dominate, which is what an asyncio application does.
 
 Reads whose pages are already resident never leave the event-loop thread: no
 submission, no driver-thread hop, no completion wakeup. On Linux the kernel
