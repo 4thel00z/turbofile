@@ -10,7 +10,13 @@ from collections.abc import Awaitable
 from typing import Any
 
 from turbofile import _turbofile
-from turbofile.binary import LARGE_READ, BinaryFile, FileContext, read_to_eof_parallel
+from turbofile.binary import (
+    LARGE_READ,
+    BinaryFile,
+    FileContext,
+    read_to_eof_parallel,
+    settled,
+)
 from turbofile.futures import KernelFuture
 from turbofile.modes import parse_mode
 from turbofile.text import TextFile, resolve_encoding
@@ -112,14 +118,6 @@ def read_bytes(path: Any) -> Awaitable[bytes]:
 
 async def read_bytes_later(path: Any) -> bytes:
     return await read_bytes(path)
-
-
-def settled(loop: asyncio.AbstractEventLoop, value: Any) -> KernelFuture:
-    """A value served inline, as the same kind of future the async path
-    returns, so a task can wrap it and a gather takes it as it is."""
-    done = KernelFuture(loop=loop)
-    done.set_result(value)
-    return done
 
 
 def finish_large_read(pending: KernelFuture, handle: int, fd: int) -> None:
