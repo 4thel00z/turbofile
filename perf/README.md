@@ -425,6 +425,63 @@ the driver each have a third of it idle. What remains is the kernel's `open`
 and `close` of 200 files spread over three threads, about 18 us per file with
 the endpoint-security scan included; the next cut is there, not in Python.
 
+### Positional reads as futures
+
+`BinaryFile.read_at` and `readinto_at` were coroutines: check the page-cache
+fast path, else await the bridge's read. Inside a running loop they now return
+the completion future itself, under the same rule as `read_bytes`: pages the
+fast path finds resident settle a `KernelFuture` at once, anything else is the
+future of the submitted kernel read, and outside a loop both return a
+coroutine. The position-based methods (`read`, `read1`, `peek`, `readline`,
+`readinto`) stopped going through `read_at`; they ask the synchronous
+`read_resident` and `readinto_resident` helpers first and submit the kernel
+read themselves, so a hot `f.read(n)` pays neither a coroutine nor a future.
+
+The trade is in the lone await. Min of nine windows on a quiet machine:
+
+| step | cost |
+| ---- | ---- |
+| create a coroutine object and close it | 49 ns |
+| `await` a coroutine that returns a value | 61 ns |
+| `KernelFuture(loop=loop)` | 104 ns |
+| `loop.create_future()` | 97 ns |
+| `await` a settled `KernelFuture` | 186 ns |
+| `await` a plain done `Future` | 177 ns |
+
+A resident read through a coroutine costs the first two lines, about 0.11 us;
+through a settled future the third and fifth, about 0.29 us. A lone
+`await f.read_at(pos, n)` on a hot page therefore gains about 0.2 us, and the
+ladder's `file_read` rung, which is exactly that call, went from 0.99 to 1.21
+to 1.25 us against a `pread` floor of 0.48 to 0.50 us in the same session.
+
+A gather gains the Task per read and, for resident pages, the driver round
+trip. 32 positional 4 KiB reads of a hot 4 MiB file on one open `BinaryFile`,
+min and p50 over 500 rounds (20,000 for the lone calls), the previous build
+against this one as wheels in two venvs, three legs each:
+
+| call | min | p50 |
+| ---- | --- | --- |
+| 32 gathered `read_at`, coroutines (before) | 114.3 to 114.8 us | 117.3 to 118.6 us |
+| 32 gathered raw `_turbofile.read` (bridge submissions, no fast path) | 87.8 to 99.2 us | 115.6 to 117.3 us |
+| 32 gathered `read_at`, futures (this change) | 47.2 to 47.4 us | 47.9 to 50.8 us |
+| lone `read_at`, coroutine (before) | 0.96 us | 1.04 to 1.08 us |
+| lone `read_at`, future (this change) | 1.17 us | 1.29 us |
+| lone `seek` + `read`, both builds | 1.21 to 1.25 us | 1.33 to 1.42 us |
+
+The gathered coroutines were slower than the raw bridge submissions: each of
+the 32 paid a Task and a resident read on the loop thread, while the bridge
+path left the loop idle and let the kernel's AIO threads copy in parallel. As
+futures the same 32 resident reads finish in 47 us, and `seek` + `read` on
+the same file is unchanged, which is the point of the synchronous helpers.
+
+The bench's "32 concurrent 4 KiB random reads" row reads through
+`turbofile.open` and `read_at` now, instead of the raw bridge call. With all
+32 pages resident that row is served on the loop thread, gathered, rather
+than by 32 driver submissions: 48.3 to 48.5 us against 116 to 119 us, 55x
+against 23x over aiofiles. The mechanism behind the row changed, not only its
+multiplier. The "4 KiB read on an open file" row goes through `read()` and
+stays at 59x; the storm stays at 14.0x.
+
 ### kqueue completions and list submission, measured
 
 XNU on macOS 26 accepts `SIGEV_KEVENT` in an aiocb's `aio_sigevent`, with the

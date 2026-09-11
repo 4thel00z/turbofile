@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import io
-from collections.abc import Buffer, Iterable
+from collections.abc import Awaitable, Buffer, Iterable
 from typing import Any
 
 from turbofile import _turbofile
+from turbofile.futures import KernelFuture
 from turbofile.modes import ModeInfo
 
 CHUNK = 65536
@@ -53,6 +55,14 @@ async def read_to_eof_parallel(handle: int, fast: Any, start: int) -> bytes:
         offset += len(probe)
 
 
+def settled(loop: asyncio.AbstractEventLoop, value: Any) -> KernelFuture:
+    """A value served inline, as the same kind of future the async path
+    returns, so a task can wrap it and a gather takes it as it is."""
+    done = KernelFuture(loop=loop)
+    done.set_result(value)
+    return done
+
+
 class BinaryFile:
     def __init__(self, handle: int, fd: int, size: int, name: Any, info: ModeInfo) -> None:
         self.handle = handle
@@ -95,29 +105,60 @@ class BinaryFile:
         if self.fast and not self.fast.supported():
             self.fast = None
 
-    async def read_at(self, pos: int, size: int) -> bytes:
-        """One positional read, page-cache fast path first.
+    def read_resident(self, pos: int, size: int) -> bytes | None:
+        """`size` bytes at `pos` from pages already resident, on this thread.
 
-        `FastPath.read` serves pages that are already resident on this thread
-        and returns None whenever the fast path does not apply: the data is not
-        resident and the read would have to block, the file cannot be checked
-        for residency without blocking, or the position does not fit the
-        kernel's off_t. Every None falls back to a kernel submission and a
-        completion hop; a file that can never be served is latched off.
+        None whenever the fast path does not apply: the data is not resident
+        and the read would have to block, the file cannot be checked for
+        residency without blocking, or the position does not fit the kernel's
+        off_t. The caller then submits the kernel read; a file that can never
+        be served this way is latched off after its first None.
         """
         data = self.fast.read(pos, size) if self.fast else None
         if data is None:
             self.fast_declined()
-            return await _turbofile.read(self.handle, pos, size)
         return data
 
-    async def readinto_at(self, pos: int, view: Buffer) -> int:
-        """`readinto` counterpart of `read_at`."""
+    def readinto_resident(self, pos: int, view: Buffer) -> int | None:
+        """`readinto` counterpart of `read_resident`."""
         n = self.fast.readinto(pos, view) if self.fast else None
         if n is None:
             self.fast_declined()
-            return await _turbofile.readinto(self.handle, pos, view)
         return n
+
+    def read_at(self, pos: int, size: int) -> Awaitable[bytes]:
+        """One positional read that leaves the file's own position alone.
+
+        Inside a running loop this is a future: resident pages settle it at
+        once, anything else is the kernel read's completion future, so a
+        gather over many positions schedules no task per read. Outside a loop
+        it is a coroutine.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return self.read_at_later(pos, size)
+        data = self.read_resident(pos, size)
+        if data is None:
+            return _turbofile.read(self.handle, pos, size)
+        return settled(loop, data)
+
+    async def read_at_later(self, pos: int, size: int) -> bytes:
+        return await self.read_at(pos, size)
+
+    def readinto_at(self, pos: int, view: Buffer) -> Awaitable[int]:
+        """`readinto` counterpart of `read_at`."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return self.readinto_at_later(pos, view)
+        n = self.readinto_resident(pos, view)
+        if n is None:
+            return _turbofile.readinto(self.handle, pos, view)
+        return settled(loop, n)
+
+    async def readinto_at_later(self, pos: int, view: Buffer) -> int:
+        return await self.readinto_at(pos, view)
 
     async def read(self, size: int | None = -1, /) -> bytes:
         self.check_open()
@@ -142,7 +183,10 @@ class BinaryFile:
             return data
         head = self.pending
         self.pending = b""
-        rest = await self.read_at(self.pos + len(head), size - len(head))
+        start, want = self.pos + len(head), size - len(head)
+        rest = self.read_resident(start, want)
+        if rest is None:
+            rest = await _turbofile.read(self.handle, start, want)
         data = head + rest if head else rest
         self.pos += len(data)
         return data
@@ -160,7 +204,9 @@ class BinaryFile:
         self.check_readable()
         want = CHUNK if size < 0 else size
         if not self.pending:
-            data = await self.read_at(self.pos, want)
+            data = self.read_resident(self.pos, want)
+            if data is None:
+                data = await _turbofile.read(self.handle, self.pos, want)
             self.pos += len(data)
             return data
         data = self.pending[:want]
@@ -175,7 +221,10 @@ class BinaryFile:
         self.check_open()
         self.check_readable()
         if not self.pending:
-            self.pending = await self.read_at(self.pos, CHUNK)
+            ahead = self.read_resident(self.pos, CHUNK)
+            if ahead is None:
+                ahead = await _turbofile.read(self.handle, self.pos, CHUNK)
+            self.pending = ahead
         return self.pending
 
     async def readline(self, size: int | None = -1, /) -> bytes:
@@ -187,7 +236,9 @@ class BinaryFile:
             parts = [self.pending]
             total = len(self.pending)
             while True:
-                chunk = await self.read_at(self.pos + total, CHUNK)
+                chunk = self.read_resident(self.pos + total, CHUNK)
+                if chunk is None:
+                    chunk = await _turbofile.read(self.handle, self.pos + total, CHUNK)
                 if not chunk:
                     break
                 found = chunk.find(b"\n")
@@ -224,7 +275,9 @@ class BinaryFile:
         self.check_readable()
         view = memoryview(buffer).cast("B")
         if not self.pending:
-            n = await self.readinto_at(self.pos, view)
+            n = self.readinto_resident(self.pos, view)
+            if n is None:
+                n = await _turbofile.readinto(self.handle, self.pos, view)
             self.pos += n
             return n
         n = min(len(view), len(self.pending))
@@ -233,7 +286,9 @@ class BinaryFile:
         self.pos += n
         if n == len(view):
             return n
-        rest = await self.readinto_at(self.pos, view[n:])
+        rest = self.readinto_resident(self.pos, view[n:])
+        if rest is None:
+            rest = await _turbofile.readinto(self.handle, self.pos, view[n:])
         self.pos += rest
         return n + rest
 
