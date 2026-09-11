@@ -331,8 +331,61 @@ opens):
 | storm p50 | 2.60 | 1.67 | 1.39 | 1.51 | 1.84 | 2.10 |
 
 Three won on this 6P+6E machine and six lost to two, since the driver, the
-event loop and the four kernel AIO threads want cores as well. The count is
-one helper per four hardware threads, at least two and at most four.
+event loop and the four kernel AIO threads want cores as well. The count was
+set to one helper per four hardware threads, at least two and at most four.
+
+Re-measured three days later on a quiet machine, with a fixed CPU-bound
+calibration loop steady before and after, as wheels in one venv per count,
+three interleaved legs of 200 storms each:
+
+| helpers | 3 | 4 | 5 | 6 |
+| ------- | ---- | ---- | ---- | ---- |
+| storm min | 1.33 to 1.35 ms | 1.17 to 1.20 ms | 1.21 to 1.30 ms | 1.35 to 1.53 ms |
+| storm p50 | 1.41 to 1.49 ms | 1.25 to 1.26 ms | 1.41 ms | 1.71 to 1.72 ms |
+
+Four beats three by a tenth on every leg, five gives it back and six loses to
+three. The earlier 1.51 ms for four did not come back; the load average at
+the time was not recorded, so the difference is unexplained. The count is now
+one helper per three hardware threads, still at least two and at most four.
+Per thread, CPU per storm with four helpers: 1.06 ms each in the kernel
+(against 1.27 ms each with three), the driver 0.69 ms, the event loop
+0.99 ms, the kernel's AIO workers 1.32 ms together; the storm's wall time
+1.17 ms min, 1.25 ms p50.
+
+### The open path's floor
+
+Why more helpers stop helping. Python probes on 200 hot 16 KiB files in one
+directory, one process, quiet machine:
+
+| syscalls per file, one thread | per file |
+| ----------------------------- | -------- |
+| `open` | 8.2 us |
+| `close` | 1.5 us |
+| `stat` by path | 1.5 us |
+| `open` + `close`, kernel CPU | 10 us |
+
+| threads doing `open` + `close` | wall per 200 files | kernel CPU per file |
+| ------------------------------ | ------------------ | ------------------- |
+| 1 | 2.00 ms | 10 us |
+| 2 | 1.47 ms | 15 us |
+| 3 | 1.17 ms | 17 us |
+| 4 | 1.06 ms | 20 us |
+| 6 | 1.14 ms | 27 us |
+
+Spreading the files over four directories changes nothing, and leaving the
+descriptors open instead of closing them scales no better, so the lock is in
+`open` itself. Three processes each opening and closing their own 200 files at
+the same time take 3.0 to 3.3 ms per round each, the same aggregate rate as
+three threads in one process: the serialization is system-wide, in the
+kernel's open path (the endpoint-security check is the likely holder), not
+the process's descriptor table. By Amdahl about 37% of an open+close, 3.7 us,
+runs one at a time machine-wide, which puts 200 opens at 0.75 ms however
+they are spread; four threads reach 1.06 ms. turbofile's storm with four
+helpers is 1.17 ms, so it sits a tenth above the pure open+close wall, and
+nothing in the process can move the serialized part. What is left per file on
+the driver side is one `fstat` on the helper (`open_sized`) and a second one
+on the driver when the read-to-end completes (`ReadJob::complete`), then the
+close.
 
 Result, the previous build against this one as wheels in two venvs, three
 interleaved rounds each:
