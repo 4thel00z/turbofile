@@ -34,11 +34,13 @@ const FALLBACK_MAX_INFLIGHT: usize = 16;
 
 /// Bounds on the threads that run `open` (and the close of a descriptor the
 /// driver owns) while the driver has a backlog. An open costs several
-/// microseconds of kernel and endpoint-security work per file and does not
-/// scale on one thread; the completions still go through the single
-/// `aio_suspend` loop. One helper per four hardware threads: on a 12-thread
-/// machine three helpers beat two, four and six on a 200-file burst, since
-/// the driver, the event loop and the kernel's AIO threads want cores too.
+/// microseconds of kernel and endpoint-security work per file, about a third
+/// of it serialized system-wide, so it scales on a few threads and no more;
+/// the completions still go through the single `aio_suspend` loop. One helper
+/// per three hardware threads: on a 12-thread machine (six performance and
+/// six efficiency cores) four helpers beat three by a tenth on a 200-file
+/// burst and five and six lose, since the driver, the event loop and the
+/// kernel's AIO threads want cores too.
 const MIN_OPEN_THREADS: usize = 2;
 const MAX_OPEN_THREADS: usize = 4;
 
@@ -60,7 +62,11 @@ pub(crate) fn spawn(rx: flume::Receiver<Msg>) -> io::Result<()> {
 
 fn open_threads() -> usize {
     let hardware = std::thread::available_parallelism().map_or(1, |n| n.get());
-    (hardware / 4).clamp(MIN_OPEN_THREADS, MAX_OPEN_THREADS)
+    helpers_for(hardware)
+}
+
+fn helpers_for(hardware: usize) -> usize {
+    (hardware / 3).clamp(MIN_OPEN_THREADS, MAX_OPEN_THREADS)
 }
 
 /// Work handed to a helper thread: an open whose descriptor comes back to the
@@ -1027,5 +1033,19 @@ fn fd_size(fd: i32) -> io::Result<u64> {
     match unsafe { libc::fstat(fd, &mut stat) } {
         0 => Ok(stat.st_size as u64),
         _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::helpers_for;
+
+    #[test]
+    fn helper_count_follows_hardware_threads() {
+        assert_eq!(helpers_for(1), 2);
+        assert_eq!(helpers_for(8), 2);
+        assert_eq!(helpers_for(10), 3);
+        assert_eq!(helpers_for(12), 4);
+        assert_eq!(helpers_for(32), 4);
     }
 }
