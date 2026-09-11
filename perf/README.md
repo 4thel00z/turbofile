@@ -62,6 +62,11 @@ plain blocking syscall.
   is the least contaminated estimator and the ratios are what matter.
 - **Check the load.** A `load average` above ~2 makes `bench.py` numbers move
   by multiples. The ladder's min-of-N is far more robust, but not immune.
+- **Calibrate the CPU.** The load average does not show everything: in one
+  overnight window it read under 2 while every probe ran eight times slower
+  than usual (a resolved future under `gather` cost 3.9 us per item instead of
+  0.42 us). Bracket a run with a fixed CPU-bound loop, `sum(range(10**7))` at
+  about 0.085 s on this machine, and discard runs whose calibration moves.
 - **Name the filesystem.** It is the single biggest confounder here.
 
 ## The filesystem trap
@@ -354,17 +359,19 @@ coroutines and the bridge.
 
 ### The task per gathered file
 
-With opens off the driver thread, the storm's remaining time split three ways
-that were all within reach of each other. Per-thread CPU per storm over 200
-storms, from mach `thread_info` on each thread of the process, taken with a
-load average near 6 from other work on the machine, so the kernel-side numbers
-run high:
+With opens off the driver thread, the storm's remaining time split across
+threads that were all within reach of each other. Per-thread CPU per storm
+over 200 storms, from mach `thread_info` on each thread of the process, on a
+quiet machine (load average 1.8 to 2.1 before the run; the storm's own threads
+lift it to about 3 while it runs):
 
-| thread | CPU per storm |
-| ------ | ------------- |
-| event loop | 1.16 ms |
-| driver | 0.81 ms |
-| each of three open helpers | 1.41 ms, all but 50 us of it in the kernel |
+| thread | coroutines (before) | futures (this change) |
+| ------ | ------------------- | --------------------- |
+| event loop | 1.05 ms | 0.73 ms |
+| driver | 0.76 ms | 0.80 ms |
+| each of three open helpers | 1.27 ms, 1.23 ms of it in the kernel | 1.22 ms, 1.17 ms of it in the kernel |
+| the kernel's AIO workers, together | 0.82 ms | 0.95 ms |
+| storm wall time, min and p50 | 1.31 ms, 1.39 ms | 1.14 ms, 1.21 ms |
 
 The loop's share is Python and asyncio. `asyncio.gather` wraps every
 coroutine it is handed in a Task: an allocation, a `call_soon` for the first
@@ -375,11 +382,11 @@ previous build:
 
 | gathered item | min | p50 |
 | ------------- | --- | --- |
-| a coroutine that returns at once | 1.85 us | 2.39 us |
-| a resolved future | 0.44 us | 0.48 us |
-| a `probe_nop` future (the bridge round trip, no I/O) | 1.33 us | 1.68 us |
-| a coroutine awaiting `probe_nop` | 3.05 us | 3.41 us |
-| a `read_bytes` coroutine, hot 16 KiB file | 6.78 us | 8.28 us |
+| a coroutine that returns at once | 1.64 us | 1.76 us |
+| a resolved future | 0.42 us | 0.43 us |
+| a `probe_nop` future (the bridge round trip, no I/O) | 1.23 us | 1.29 us |
+| a coroutine awaiting `probe_nop` | 2.79 us | 3.03 us |
+| a `read_bytes` coroutine, hot 16 KiB file | 6.61 us | 7.01 us |
 
 `read_bytes` and `write_bytes` were coroutines that awaited one future and
 returned its value; the only work after the await was the large-file handoff.
@@ -398,20 +405,24 @@ coroutine, so `asyncio.run(turbofile.read_bytes(p))` works as before.
 Two smaller cuts on the same path: the future class has `__slots__`, so no
 per-future `__dict__` is allocated when the drain stores its op ids, and the
 drain no longer asks `done()` before settling, since nothing but the drain
-settles a kernel future. Together they take the `probe_nop` item from 1.33 to
-1.10 us.
+settles a kernel future. Together they take the `probe_nop` item from 1.23 to
+1.09 us, and the `read_bytes` item from 6.61 to 5.71 us.
 
 Result, the previous build against this one as wheels in two venvs, three
-interleaved legs of 200 storms each, load average 5 to 6:
+interleaved legs of 200 storms each, same quiet machine:
 
 | build | storm min | storm p50 | loop CPU per storm |
 | ----- | --------- | --------- | ------------------ |
-| coroutines (before) | 1.32 to 1.35 ms | 1.39 to 1.52 ms | 1.08 to 1.21 ms |
-| futures (this change) | 1.19 to 1.20 ms | 1.25 to 1.33 ms | 0.80 to 0.90 ms |
+| coroutines (before) | 1.35 to 1.43 ms | 1.44 to 1.55 ms | 1.09 to 1.16 ms |
+| futures (this change) | 1.15 to 1.18 ms | 1.25 to 1.37 ms | 0.75 to 0.81 ms |
 
-The loop's CPU per storm drops by a quarter and the wall time by a tenth: the
-driver and the helpers now hold the storm's floor, so the rest of the loop's
-saving shows up as idle time, not speed.
+The loop's CPU per storm drops by a third and the wall time by a sixth. The
+profile above says where the storm's floor is now: each open helper spends
+1.22 ms of CPU per storm, nearly all of it in the kernel, against a wall time
+of 1.14 ms, so the three helpers are busy for the whole storm and the loop and
+the driver each have a third of it idle. What remains is the kernel's `open`
+and `close` of 200 files spread over three threads, about 18 us per file with
+the endpoint-security scan included; the next cut is there, not in Python.
 
 ### kqueue completions and list submission, measured
 
