@@ -352,6 +352,17 @@ Per thread, CPU per storm with four helpers: 1.06 ms each in the kernel
 0.99 ms, the kernel's AIO workers 1.32 ms together; the storm's wall time
 1.17 ms min, 1.25 ms p50.
 
+Merged after the whole-file and positional futures (#14, #18), so the
+bench's storm row was measured again on that master the next night at 01:40:
+one-minute load 1.6 to 2.2, the calibration loop at 0.091 to 0.092 s. Thread
+profile over 200 storms: wall 0.89 ms min and 1.05 ms p50, the four helpers
+1.05 ms of kernel time each, the driver 0.75 ms, the event loop 0.71 ms, the
+AIO workers 1.35 ms together. `make bench` three times put turbofile's storm
+at 0.99, 1.09 and 1.01 ms p50 against 1.21 to 1.22 ms on the #14 build that
+morning, a sixth less. aiofiles measured 14.6 to 14.9 ms in this window
+against 17.0 ms in the morning's, so the row moves from 14.0x to 14.5x
+(median of the three) by less than turbofile's own time did.
+
 ### The open path's floor
 
 Why more helpers stop helping. Python probes on 200 hot 16 KiB files in one
