@@ -96,7 +96,7 @@ page-cache-hot files, mains power):
 | ------------------------------------------ | ----------- |
 | 4 KiB read on an open file                 | 59x         |
 | 32 concurrent 4 KiB random reads           | 55x         |
-| 200 small files read concurrently          | 14.0x       |
+| 200 small files read concurrently          | 14.5x       |
 | 4 KiB whole-file read (`read_bytes`)       | 3.5x        |
 | 8 MiB whole-file read (`read_bytes`)       | 1.4x        |
 | 8 MiB whole-file read (`open` + `read`)    | 1.5x        |
