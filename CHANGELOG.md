@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.6](https://github.com/4thel00z/turbofile/compare/v0.1.5...v0.1.6) (2026-09-12)
+
+
+### Documentation
+
+* bench the storm row on master with four open helpers ([b2bc461](https://github.com/4thel00z/turbofile/commit/b2bc46119c6bfa2b035dfe9a2f5704d265743279))
+* bench the storm row on master with four open helpers ([6c0d239](https://github.com/4thel00z/turbofile/commit/6c0d2399821236a67b21636dee4b9dd3620b443c))
+
 ## [0.1.5](https://github.com/4thel00z/turbofile/compare/v0.1.4...v0.1.5) (2026-09-11)
 
 
