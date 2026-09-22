@@ -63,7 +63,7 @@ plain blocking syscall.
 - **Check the load.** A `load average` above ~2 makes `bench.py` numbers move
   by multiples. The ladder's min-of-N is far more robust, but not immune.
 - **Calibrate the CPU.** The load average does not show everything: in one
-  overnight window it read under 2 while every probe ran eight times slower
+  window it read under 2 while every probe ran eight times slower
   than usual (a resolved future under `gather` cost 3.9 us per item instead of
   0.42 us). Bracket a run with a fixed CPU-bound loop, `sum(range(10**7))` at
   about 0.085 s on this machine, and discard runs whose calibration moves.
@@ -334,7 +334,7 @@ Three won on this 6P+6E machine and six lost to two, since the driver, the
 event loop and the four kernel AIO threads want cores as well. The count was
 set to one helper per four hardware threads, at least two and at most four.
 
-Re-measured three days later on a quiet machine, with a fixed CPU-bound
+Re-measured on a quiet machine, with a fixed CPU-bound
 calibration loop steady before and after, as wheels in one venv per count,
 three interleaved legs of 200 storms each:
 
@@ -353,15 +353,14 @@ Per thread, CPU per storm with four helpers: 1.06 ms each in the kernel
 1.17 ms min, 1.25 ms p50.
 
 Merged after the whole-file and positional futures (#14, #18), so the
-bench's storm row was measured again on that master the next night at 01:40:
-one-minute load 1.6 to 2.2, the calibration loop at 0.091 to 0.092 s. Thread
-profile over 200 storms: wall 0.89 ms min and 1.05 ms p50, the four helpers
-1.05 ms of kernel time each, the driver 0.75 ms, the event loop 0.71 ms, the
-AIO workers 1.35 ms together. `make bench` three times put turbofile's storm
-at 0.99, 1.09 and 1.01 ms p50 against 1.21 to 1.22 ms on the #14 build that
-morning, a sixth less. aiofiles measured 14.6 to 14.9 ms in this window
-against 17.0 ms in the morning's, so the row moves from 14.0x to 14.5x
-(median of the three) by less than turbofile's own time did.
+bench's storm row was measured again on that master: one-minute load 1.6 to
+2.2, calibration loop 0.091 to 0.092 s. Thread profile over 200 storms: wall
+0.89 ms min and 1.05 ms p50, the four helpers 1.05 ms of kernel time each,
+the driver 0.75 ms, the event loop 0.71 ms, the AIO workers 1.35 ms together.
+`make bench` three times put turbofile's storm at 0.99, 1.09 and 1.01 ms p50
+against 1.21 to 1.22 ms on the #14 build, a sixth less; aiofiles measured
+14.6 to 14.9 ms against 17.0 ms in the #14 run, so the row moves from 14.0x
+to 14.5x (median of the three) by less than turbofile's own time did.
 
 ### The open path's floor
 
