@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.6](https://github.com/4thel00z/turbofile/compare/v0.1.5...v0.1.6) (2026-09-22)
+
+
+### Documentation
+
+* bench the storm row on master with four open helpers ([b2bc461](https://github.com/4thel00z/turbofile/commit/b2bc46119c6bfa2b035dfe9a2f5704d265743279))
+* bench the storm row on master with four open helpers ([6c0d239](https://github.com/4thel00z/turbofile/commit/6c0d2399821236a67b21636dee4b9dd3620b443c))
+* **perf:** drop the times of day from the measurement notes ([d5d0194](https://github.com/4thel00z/turbofile/commit/d5d0194a9f4d49860f39a0a73e881ef52fdf50dc))
+* **perf:** drop the times of day from the measurement notes ([692e7ff](https://github.com/4thel00z/turbofile/commit/692e7ff25a925329d2eef4fed67b3163d17e3823))
+
 ## [0.1.5](https://github.com/4thel00z/turbofile/compare/v0.1.4...v0.1.5) (2026-09-11)
 
 
